@@ -2,8 +2,8 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:conversation-bundle",
   "visibility": "public",
-  "url": "",
-  "description": "Modular generic service: text-to-speech",
+  "url": "https://github.com/viam-modules/conversation-bundle",
+  "description": "Conversation related resources",
   "models": [
     {
       "api": "rdk:service:generic",
@@ -15,7 +15,7 @@
   "applications": null,
   "markdown_link": "README.md",
   "entrypoint": "bin/conversation-bundle",
-  "first_run": "",
+  "first_run": "first_run.sh",
   "build": {
     "build": "make module.tar.gz",
     "setup": "make setup",
