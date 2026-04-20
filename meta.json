@@ -4,6 +4,14 @@
   "visibility": "public",
   "url": "",
   "description": "Modular generic service: text-to-speech",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:conversation-bundle:text-to-speech",
+      "short_description": "Text-to-speech service using Google Cloud TTS API with audioout playback.",
+      "markdown_link": "README.md#model-viamconversation-bundletext-to-speech"
+    }
+  ],
   "applications": null,
   "markdown_link": "README.md",
   "entrypoint": "bin/conversation-bundle",
