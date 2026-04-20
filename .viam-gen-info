@@ -1,0 +1,13 @@
+{
+  "module_name": "conversation-bundle",
+  "visibility": "public",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "text-to-speech",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-04-20T21:09:27.030245Z",
+  "module_readme_link": "README.md"
+}
