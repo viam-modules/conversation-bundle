@@ -30,7 +30,11 @@ func realMain() error {
 	if err != nil {
 		return err
 	}
-	defer ttsResource.Close(ctx)
+	defer func() {
+		if err := ttsResource.Close(ctx); err != nil {
+			logger.Errorw("failed to close text-to-speech resource", "error", err)
+		}
+	}()
 
 	return nil
 }

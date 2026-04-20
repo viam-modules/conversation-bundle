@@ -97,7 +97,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	}
 
 	ttsClient, err := texttospeech.NewClient(ctx,
-		option.WithCredentialsJSON(credBytes),
+		option.WithAuthCredentialsJSON(option.ServiceAccount, credBytes),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Google TTS client: %w", err)
