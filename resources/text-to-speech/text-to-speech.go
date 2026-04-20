@@ -1,8 +1,8 @@
-// Package conversationbundle registers a viam:conversation-bundle:text-to-speech
+// Package texttospeech registers a viam:conversation-bundle:text-to-speech
 // model that implements the rdk:service:generic API. It synthesises audio via
 // the Google Cloud Text-to-Speech API and plays it through an
 // rdk:component:audio_out dependency.
-package conversationbundle
+package texttospeech
 
 import (
 	"context"
@@ -27,12 +27,12 @@ const defaultSampleRateHz = 24000
 // asyncQueueSize caps how many pending say_async requests can be buffered.
 const asyncQueueSize = 64
 
-var TextToSpeech = resource.NewModel("viam", "conversation-bundle", "text-to-speech")
+var Model = resource.NewModel("viam", "conversation-bundle", "text-to-speech")
 
 func init() {
-	resource.RegisterService(generic.API, TextToSpeech,
+	resource.RegisterService(generic.API, Model,
 		resource.Registration[resource.Resource, *Config]{
-			Constructor: newConversationBundleTextToSpeech,
+			Constructor: newService,
 		},
 	)
 }
@@ -54,7 +54,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	return []string{cfg.AudioOutName}, nil, nil
 }
 
-type conversationBundleTextToSpeech struct {
+type ttsService struct {
 	resource.AlwaysRebuild
 
 	name         resource.Name
@@ -77,15 +77,15 @@ type conversationBundleTextToSpeech struct {
 	workerWG     sync.WaitGroup
 }
 
-func newConversationBundleTextToSpeech(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
+func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
 	conf, err := resource.NativeConfig[*Config](rawConf)
 	if err != nil {
 		return nil, err
 	}
-	return NewTextToSpeech(ctx, deps, rawConf.ResourceName(), conf, logger)
+	return New(ctx, deps, rawConf.ResourceName(), conf, logger)
 }
 
-func NewTextToSpeech(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
+func New(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
 	ao, err := audioout.FromProvider(deps, conf.AudioOutName)
 	if err != nil {
 		return nil, fmt.Errorf("audio_out %q not found in dependencies: %w", conf.AudioOutName, err)
@@ -108,7 +108,7 @@ func NewTextToSpeech(ctx context.Context, deps resource.Dependencies, name resou
 		lang = "en-US"
 	}
 
-	s := &conversationBundleTextToSpeech{
+	s := &ttsService{
 		name:         name,
 		logger:       logger,
 		audioOut:     ao,
@@ -126,11 +126,11 @@ func NewTextToSpeech(ctx context.Context, deps resource.Dependencies, name resou
 	return s, nil
 }
 
-func (s *conversationBundleTextToSpeech) Name() resource.Name {
+func (s *ttsService) Name() resource.Name {
 	return s.name
 }
 
-func (s *conversationBundleTextToSpeech) Say(ctx context.Context, text string) (string, error) {
+func (s *ttsService) Say(ctx context.Context, text string) (string, error) {
 	if err := s.synthesizeAndPlay(ctx, text); err != nil {
 		return "", err
 	}
@@ -141,7 +141,7 @@ func (s *conversationBundleTextToSpeech) Say(ctx context.Context, text string) (
 // audio through the speaker, serialized behind playMu so no two playbacks
 // overlap. Synthesis happens outside the mutex so queued requests can be
 // prepared while another playback is still in progress.
-func (s *conversationBundleTextToSpeech) synthesizeAndPlay(ctx context.Context, text string) error {
+func (s *ttsService) synthesizeAndPlay(ctx context.Context, text string) error {
 	s.logger.Infof("synthesising: %q", text)
 
 	voice := &texttospeechpb.VoiceSelectionParams{
@@ -184,7 +184,7 @@ func (s *conversationBundleTextToSpeech) synthesizeAndPlay(ctx context.Context, 
 // playing each text sequentially. Because it pulls a single item at a time
 // and playback is serialized behind playMu, a queued say_async will only
 // reach the speaker once any prior speech (sync or async) has finished.
-func (s *conversationBundleTextToSpeech) asyncWorker() {
+func (s *ttsService) asyncWorker() {
 	defer s.workerWG.Done()
 	for {
 		select {
@@ -201,7 +201,7 @@ func (s *conversationBundleTextToSpeech) asyncWorker() {
 	}
 }
 
-func (s *conversationBundleTextToSpeech) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+func (s *ttsService) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if text, ok := cmd["say"].(string); ok {
 		result, err := s.Say(ctx, text)
 		if err != nil {
@@ -239,11 +239,11 @@ func monoToStereo(mono []byte) []byte {
 	return stereo
 }
 
-func (s *conversationBundleTextToSpeech) Status(ctx context.Context) (map[string]interface{}, error) {
+func (s *ttsService) Status(ctx context.Context) (map[string]interface{}, error) {
 	return map[string]interface{}{}, nil
 }
 
-func (s *conversationBundleTextToSpeech) Close(ctx context.Context) error {
+func (s *ttsService) Close(ctx context.Context) error {
 	if s.workerCancel != nil {
 		s.workerCancel()
 	}

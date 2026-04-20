@@ -9,7 +9,7 @@ ifeq ($(VIAM_TARGET_OS), windows)
 	MODULE_BINARY = bin/conversation-bundle.exe
 endif
 
-$(MODULE_BINARY): Makefile go.mod *.go cmd/module/*.go 
+$(MODULE_BINARY): Makefile go.mod cmd/module/*.go resources/*/*.go
 	GOOS=$(VIAM_BUILD_OS) GOARCH=$(VIAM_BUILD_ARCH) $(GO_BUILD_ENV) go build $(GO_BUILD_FLAGS) -o $(MODULE_BINARY) cmd/module/main.go
 
 lint:
