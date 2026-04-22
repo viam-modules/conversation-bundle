@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  settings:
+    staticcheck:
+      # Mirror golangci-lint's default disabled stylechecks, plus disable
+      # ST1005 so that proper nouns (e.g. "Google") are allowed at the start
+      # of error strings.
+      checks:
+        - "all"
+        - "-ST1000" # at least one file in a package should have a package comment
+        - "-ST1003" # poorly chosen identifier (e.g. snake_case in Go)
+        - "-ST1005" # error strings should not be capitalized
+        - "-ST1016" # methods on the same type should have the same receiver name
+        - "-ST1020" # comment on exported function should be of the form "Foo does X."
+        - "-ST1021" # comment on exported type should be of the form "Foo is X."
+        - "-ST1022" # comment on exported variable should be of the form "Foo is X."

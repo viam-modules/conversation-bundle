@@ -9,11 +9,12 @@ ifeq ($(VIAM_TARGET_OS), windows)
 	MODULE_BINARY = bin/conversation-bundle.exe
 endif
 
-$(MODULE_BINARY): Makefile go.mod *.go cmd/module/*.go 
+$(MODULE_BINARY): Makefile go.mod cmd/module/*.go resources/*/*.go
 	GOOS=$(VIAM_BUILD_OS) GOARCH=$(VIAM_BUILD_ARCH) $(GO_BUILD_ENV) go build $(GO_BUILD_FLAGS) -o $(MODULE_BINARY) cmd/module/main.go
 
 lint:
 	gofmt -s -w .
+	golangci-lint run
 
 update:
 	go get go.viam.com/rdk@latest
@@ -22,11 +23,11 @@ update:
 test:
 	go test ./...
 
-module.tar.gz: meta.json $(MODULE_BINARY)
+module.tar.gz: meta.json first_run.sh $(MODULE_BINARY)
 ifneq ($(VIAM_TARGET_OS), windows)
 	strip $(MODULE_BINARY)
 endif
-	tar czf $@ meta.json $(MODULE_BINARY)
+	tar czf $@ meta.json first_run.sh $(MODULE_BINARY)
 
 module: test module.tar.gz
 

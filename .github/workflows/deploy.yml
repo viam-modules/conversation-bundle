@@ -1,23 +1,61 @@
-# see https://github.com/viamrobotics/build-action for help
+name: Deploy Module
 on:
-  push:
-    tags:
-      # we support 0.0.1, v0.0.1, 0.0.1-rc1, v0.0.1-rc1
-      - "v?[0-9]+.[0-9]+.[0-9]+"
-      - "v?[0-9]+.[0-9]+.[0-9]+-rc[0-9]+"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag (e.g. v0.0.21)
+        required: true
 
+permissions:
+  contents: read
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  publish-module:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: viamrobotics/build-action@v1
+      # actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Build and upload to Viam Registry
+        # viamrobotics/build-action@v1.7
+        uses: viamrobotics/build-action@cd35d596eabba93e9b6776f708c54865ec1c8360
         with:
-          # note: you can replace this line with 'version: ""' if
-          # you want to test the build process without deploying
-          version: ${{ github.ref_name }}
+          version: ${{ inputs.version || github.ref_name }}
           ref: ${{ github.sha }}
-          key-id: ${{ secrets.viam_key_id }}
-          key-value: ${{ secrets.viam_key_value }}
-          token: ${{ github.token }} # only required for private git repos
+          key-id: ${{ secrets.viam_dev_api_key_id }}
+          key-value: ${{ secrets.viam_dev_api_key }}
+          token: ${{ github.token }}
+
+  send-slack-msg:
+    name: Send Slack Message
+    needs: [publish-module]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Generate success value
+        id: success-value
+        run: |
+          echo "result=${{ needs.publish-module.result == 'success' && 'success' || 'failure' }}" >> $GITHUB_OUTPUT
+
+      - name: Send slack message
+        # slackapi/slack-github-action@v2.1.1
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {
+              "channel": "${{ secrets.SLACK_CHANNEL_ID }}",
+              "text": "Deploy ${{ inputs.version || github.ref_name }} ${{ steps.success-value.outputs.result == 'success' && '*succeeded* :white_check_mark:' || '*failed* :x:'}}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "${{ steps.success-value.outputs.result == 'success' && format('Deploy *{0}* *succeeded* :white_check_mark:\n\t<{1}/{2}/releases/tag/{0}|Release {0}>', inputs.version || github.ref_name, github.server_url, github.repository) || format('Deploy *{0}* *failed* :x:', inputs.version || github.ref_name) }}\n\tModule: ${{ needs.publish-module.result }}\n\t<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow run>"
+                  }
+                }
+              ]
+            }

@@ -2,12 +2,20 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:conversation-bundle",
   "visibility": "public",
-  "url": "",
-  "description": "Modular generic service: text-to-speech",
+  "url": "https://github.com/viam-modules/conversation-bundle",
+  "description": "Conversation related resources",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:conversation-bundle:text-to-speech",
+      "short_description": "Text-to-speech service using Google Cloud TTS API with audioout playback.",
+      "markdown_link": "README.md#model-viamconversation-bundletext-to-speech"
+    }
+  ],
   "applications": null,
   "markdown_link": "README.md",
   "entrypoint": "bin/conversation-bundle",
-  "first_run": "",
+  "first_run": "first_run.sh",
   "build": {
     "build": "make module.tar.gz",
     "setup": "make setup",

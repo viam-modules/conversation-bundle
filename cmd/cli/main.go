@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
-	"conversationbundle"
+
+	texttospeech "conversationbundle/resources/text-to-speech"
+
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	generic "go.viam.com/rdk/services/generic"
@@ -22,13 +24,17 @@ func realMain() error {
 	deps := resource.Dependencies{}
 	// can load these from a remote machine if you need
 
-	cfg := conversationbundle.Config{}
+	cfg := texttospeech.Config{}
 
-	thing, err := conversationbundle.NewTextToSpeech(ctx, deps, generic.Named("foo"), &cfg, logger)
+	ttsResource, err := texttospeech.New(ctx, deps, generic.Named("foo"), &cfg, logger)
 	if err != nil {
 		return err
 	}
-	defer thing.Close(ctx)
+	defer func() {
+		if err := ttsResource.Close(ctx); err != nil {
+			logger.Errorw("failed to close text-to-speech resource", "error", err)
+		}
+	}()
 
 	return nil
 }
