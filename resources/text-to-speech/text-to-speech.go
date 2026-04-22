@@ -239,8 +239,7 @@ func monoToStereo(mono []byte) []byte {
 
 func (s *ttsService) Status(ctx context.Context) (map[string]interface{}, error) {
 	return map[string]interface{}{
-		"async_queue_size":     len(s.asyncQueue),
-		"async_queue_capacity": cap(s.asyncQueue),
+		"queued_messages_count": len(s.asyncQueue),
 	}, nil
 }
 
