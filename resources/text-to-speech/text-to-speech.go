@@ -1,7 +1,4 @@
-// Package texttospeech registers a viam:conversation-bundle:text-to-speech
-// model that implements the rdk:service:generic API. It synthesises audio via
-// the Google Cloud Text-to-Speech API and plays it through an
-// rdk:component:audio_out dependency.
+// Package texttospeech provides the viam:conversation-bundle:text-to-speech model.
 package texttospeech
 
 import (
@@ -147,6 +144,7 @@ func (s *ttsService) synthesizeAndPlay(ctx context.Context, text string) error {
 	voice := &texttospeechpb.VoiceSelectionParams{
 		LanguageCode: s.languageCode,
 	}
+	// If voice name is blank, Google picks a default voice for the language.
 	if s.voiceName != "" {
 		voice.Name = s.voiceName
 	}
