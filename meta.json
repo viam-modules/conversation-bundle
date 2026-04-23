@@ -13,9 +13,9 @@
     },
     {
       "api": "rdk:service:generic",
-      "model": "viam:conversation-bundle:voice-order",
-      "short_description": "Voice-order orchestrator: wake word + Google STT + Claude + TTS, dispatches parsed orders via DoCommand to a configured target service.",
-      "markdown_link": "README.md#model-viamconversation-bundlevoice-order"
+      "model": "viam:conversation-bundle:voice-command",
+      "short_description": "Voice-command orchestrator: wake word + Google STT + Claude + TTS, classifies utterances against a configured list of commands and dispatches via DoCommand to target resources.",
+      "markdown_link": "README.md#model-viamconversation-bundlevoice-command"
     }
   ],
   "applications": null,

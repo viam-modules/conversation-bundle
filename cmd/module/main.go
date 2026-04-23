@@ -2,7 +2,7 @@ package main
 
 import (
 	texttospeech "conversationbundle/resources/text-to-speech"
-	voiceorder "conversationbundle/resources/voice-order"
+	voicecommand "conversationbundle/resources/voice-command"
 
 	"go.viam.com/rdk/module"
 	"go.viam.com/rdk/resource"
@@ -13,6 +13,6 @@ func main() {
 	// ModularMain can take multiple APIModel arguments, if your module implements multiple models.
 	module.ModularMain(
 		resource.APIModel{API: generic.API, Model: texttospeech.Model},
-		resource.APIModel{API: generic.API, Model: voiceorder.Model},
+		resource.APIModel{API: generic.API, Model: voicecommand.Model},
 	)
 }

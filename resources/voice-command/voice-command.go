@@ -1,9 +1,10 @@
-// Package voiceorder provides the viam:conversation-bundle:voice-order model —
-// an orchestrator that listens for a wake word on a microphone, transcribes
-// the following utterance, classifies it against a configured list of
-// commands via Claude, dispatches the matched command's DoCommand payload to
-// its target resource, and speaks the reply through a text-to-speech service.
-package voiceorder
+// Package voicecommand provides the viam:conversation-bundle:voice-command
+// model — an orchestrator that listens for a wake word on a microphone,
+// transcribes the following utterance, classifies it against a configured
+// list of commands via Claude, dispatches the matched command's DoCommand
+// payload to its target resource, and speaks the reply through a
+// text-to-speech service.
+package voicecommand
 
 import (
 	"context"
@@ -30,7 +31,7 @@ import (
 	googleoption "google.golang.org/api/option"
 )
 
-var Model = resource.NewModel("viam", "conversation-bundle", "voice-order")
+var Model = resource.NewModel("viam", "conversation-bundle", "voice-command")
 
 func init() {
 	resource.RegisterService(generic.API, Model,
@@ -40,10 +41,10 @@ func init() {
 	)
 }
 
-// CommandEntry is one user-facing action voice-order can dispatch. The LLM
-// sees Name + Description and returns the Name of the entry it chose (or
-// nothing, to take no action); voice-order looks the entry up and dispatches
-// DoCommand verbatim to the named Resource.
+// CommandEntry is one user-facing action voice-command can dispatch. The
+// LLM sees Name + Description and returns the Name of the entry it chose
+// (or nothing, to take no action); voice-command looks the entry up and
+// dispatches DoCommand verbatim to the named Resource.
 type CommandEntry struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description"`
@@ -148,14 +149,14 @@ type service struct {
 	commands  map[string]CommandEntry
 	resources map[string]resource.Resource
 
-	wakeWord        string
-	wakeCooldown    time.Duration
-	convoTimeout    time.Duration
-	maxWords        int
-	languageCode    string
-	systemPrompt    string
-	maxTokens       int64
-	anthropicModel  anthropic.Model
+	wakeWord       string
+	wakeCooldown   time.Duration
+	convoTimeout   time.Duration
+	maxWords       int
+	languageCode   string
+	systemPrompt   string
+	maxTokens      int64
+	anthropicModel anthropic.Model
 
 	speechClient    *speech.Client
 	anthropicClient anthropic.Client
@@ -167,7 +168,7 @@ type service struct {
 	mu       sync.Mutex
 	lastWake time.Time
 	// convoExpiresAt is non-zero while a conversation window is open.
-	// During the window, voice-order skips wake-word gating and passes
+	// During the window, voice-command skips wake-word gating and passes
 	// convoHistory to the LLM so follow-up utterances carry context.
 	convoExpiresAt time.Time
 	convoHistory   []anthropic.MessageParam
@@ -209,7 +210,9 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	if err != nil {
 		return nil, fmt.Errorf("marshal google credentials: %w", err)
 	}
-	speechClient, err := speech.NewClient(ctx, googleoption.WithCredentialsJSON(credBytes))
+	speechClient, err := speech.NewClient(ctx,
+		googleoption.WithAuthCredentialsJSON(googleoption.ServiceAccount, credBytes),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("google speech client: %w", err)
 	}
@@ -278,21 +281,21 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 // suffix (Config.SystemPrompt) carries tone/style, not domain knowledge.
 func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	var b strings.Builder
-	b.WriteString("You are a voice-controlled assistant. A customer just spoke to you. Pick at most one of the following commands to dispatch, and produce a short spoken reply.\n\n")
+	b.WriteString("You are a voice-controlled assistant. A user just spoke to you. Pick at most one of the following commands to dispatch, and produce a short spoken reply.\n\n")
 	b.WriteString("Available commands:\n")
 	for _, c := range cmds {
 		fmt.Fprintf(&b, "- %q — %s\n", c.Name, c.Description)
 	}
 	b.WriteString("\nRespond with exactly one JSON object and nothing else. No prose before or after, no markdown code fences:\n\n")
 	b.WriteString("{\n")
-	b.WriteString("  \"response\": \"<a short friendly sentence to say to the customer>\",\n")
+	b.WriteString("  \"response\": \"<a short friendly sentence to say to the user>\",\n")
 	b.WriteString("  \"command\": \"<name from the list, or null>\",\n")
 	b.WriteString("  \"continue_conversation\": <true or false>\n")
 	b.WriteString("}\n\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Always produce a non-empty \"response\". Every turn gets a spoken reply — confirmations, acknowledgments, thank-yous, farewells, or even a good-natured \"sorry, didn't catch that\" for vague input. Never return an empty string.\n")
 	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null and still say something natural in \"response\".\n")
-	b.WriteString("- Set \"continue_conversation\" to true when you expect the customer to reply — you asked a clarifying question, they're mid-order, or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., order placed and confirmed, explicit farewell). Err on the side of true if unsure, so customers can chime back in.\n")
+	b.WriteString("- Set \"continue_conversation\" to true when you expect a follow-up — you asked a clarifying question or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., the requested action was confirmed or the user said goodbye). Err on the side of true if unsure, so the user can chime back in.\n")
 	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.")
 	if strings.TrimSpace(userSuffix) != "" {
@@ -384,7 +387,7 @@ func (s *service) run() {
 		if inConvo {
 			listenCtx, cancel = context.WithDeadline(s.workerCtx, deadline)
 		}
-		utterance, err := s.listenForOrder(listenCtx, inConvo)
+		utterance, err := s.listenForCommand(listenCtx, inConvo)
 		if cancel != nil {
 			cancel()
 		}
@@ -448,10 +451,11 @@ func (s *service) run() {
 	}
 }
 
-// listenForOrder opens a Google STT streaming session, pipes mic audio to it,
-// waits for the wake word (or any utterance if startInConversation is true),
-// and returns the captured utterance once Google marks it final.
-func (s *service) listenForOrder(ctx context.Context, startInConversation bool) (string, error) {
+// listenForCommand opens a Google STT streaming session, pipes mic audio
+// to it, waits for the wake word (or any utterance if startInConversation
+// is true), and returns the captured utterance once Google marks it final
+// (or earlier if the word-count cap is hit).
+func (s *service) listenForCommand(ctx context.Context, startInConversation bool) (string, error) {
 	chunks, err := s.mic.GetAudio(ctx, "pcm16", 0, 0, nil)
 	if err != nil {
 		return "", fmt.Errorf("open mic: %w", err)
@@ -532,7 +536,7 @@ func (s *service) listenForOrder(ctx context.Context, startInConversation bool) 
 	if startInConversation {
 		state = stateListening
 	}
-	var orderText strings.Builder
+	var captureBuf strings.Builder
 
 	defer func() {
 		pipeCancel()
@@ -586,8 +590,8 @@ func (s *service) listenForOrder(ctx context.Context, startInConversation bool) 
 					return after, nil
 				}
 				if after != "" {
-					orderText.Reset()
-					orderText.WriteString(after)
+					captureBuf.Reset()
+					captureBuf.WriteString(after)
 				}
 			case stateListening:
 				trimmed := strings.TrimSpace(transcript)
@@ -618,7 +622,7 @@ func (s *service) listenForOrder(ctx context.Context, startInConversation bool) 
 					if post != "" {
 						return post, nil
 					}
-					return strings.TrimSpace(orderText.String()), nil
+					return strings.TrimSpace(captureBuf.String()), nil
 				}
 			}
 		}
