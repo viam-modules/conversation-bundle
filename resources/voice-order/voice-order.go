@@ -1,8 +1,8 @@
 // Package voiceorder provides the viam:conversation-bundle:voice-order model —
 // an orchestrator that listens for a wake word on a microphone, transcribes
-// the following utterance, interprets it with Claude, dispatches a structured
-// order to a target service via DoCommand, and speaks the reply through a
-// text-to-speech service.
+// the following utterance, classifies it against a configured list of
+// commands via Claude, dispatches the matched command's DoCommand payload to
+// its target resource, and speaks the reply through a text-to-speech service.
 package voiceorder
 
 import (
@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -38,11 +39,22 @@ func init() {
 	)
 }
 
+// CommandEntry is one user-facing action voice-order can dispatch. The LLM
+// sees Name + Description and returns the Name of the entry it chose (or
+// nothing, to take no action); voice-order looks the entry up and dispatches
+// DoCommand verbatim to the named Resource.
+type CommandEntry struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Resource    string                 `json:"resource"`
+	DoCommand   map[string]interface{} `json:"do_command"`
+}
+
 type Config struct {
-	AudioInName       string `json:"audio_in"`
-	TextToSpeechName  string `json:"text_to_speech"`
-	TargetServiceName string `json:"target_service"`
-	TargetCommandKey  string `json:"target_command"`
+	AudioInName      string `json:"audio_in"`
+	TextToSpeechName string `json:"text_to_speech"`
+
+	Commands []CommandEntry `json:"commands"`
 
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
@@ -52,8 +64,12 @@ type Config struct {
 
 	AnthropicAPIKey string `json:"anthropic_api_key"`
 	LLMModel        string `json:"llm_model,omitempty"`
-	SystemPrompt    string `json:"system_prompt"`
-	MaxTokens       int    `json:"max_tokens,omitempty"`
+	// SystemPrompt is an optional free-form suffix appended to the
+	// auto-generated system prompt (which already contains the command list
+	// and output-format instructions). Use it for tone/style guidance
+	// ("respond warmly", "keep replies under 20 words", etc.).
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	MaxTokens    int    `json:"max_tokens,omitempty"`
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
@@ -63,22 +79,46 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.TextToSpeechName == "" {
 		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "text_to_speech")
 	}
-	if cfg.TargetServiceName == "" {
-		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "target_service")
-	}
-	if cfg.TargetCommandKey == "" {
-		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "target_command")
-	}
 	if len(cfg.GoogleCredJSON) == 0 {
 		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "google_credentials_json")
 	}
 	if cfg.AnthropicAPIKey == "" {
 		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "anthropic_api_key")
 	}
-	if cfg.SystemPrompt == "" {
-		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "system_prompt")
+	if len(cfg.Commands) == 0 {
+		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "commands")
 	}
-	return []string{cfg.AudioInName, cfg.TextToSpeechName, cfg.TargetServiceName}, nil, nil
+
+	seenNames := map[string]bool{}
+	resourceSet := map[string]bool{}
+	for i, c := range cfg.Commands {
+		if c.Name == "" {
+			return nil, nil, fmt.Errorf("%s: commands[%d].name is required", path, i)
+		}
+		if seenNames[c.Name] {
+			return nil, nil, fmt.Errorf("%s: commands[%d].name %q is not unique", path, i, c.Name)
+		}
+		seenNames[c.Name] = true
+		if c.Description == "" {
+			return nil, nil, fmt.Errorf("%s: commands[%d].description is required", path, i)
+		}
+		if c.Resource == "" {
+			return nil, nil, fmt.Errorf("%s: commands[%d].resource is required", path, i)
+		}
+		if len(c.DoCommand) == 0 {
+			return nil, nil, fmt.Errorf("%s: commands[%d].do_command is required", path, i)
+		}
+		resourceSet[c.Resource] = true
+	}
+
+	deps := []string{cfg.AudioInName, cfg.TextToSpeechName}
+	resources := make([]string, 0, len(resourceSet))
+	for r := range resourceSet {
+		resources = append(resources, r)
+	}
+	sort.Strings(resources)
+	deps = append(deps, resources...)
+	return deps, nil, nil
 }
 
 type service struct {
@@ -87,16 +127,19 @@ type service struct {
 	name   resource.Name
 	logger logging.Logger
 
-	mic           audioin.AudioIn
-	tts           resource.Resource
-	target        resource.Resource
-	targetCmdKey  string
+	mic audioin.AudioIn
+	tts resource.Resource
 
-	wakeWord      string
-	wakeCooldown  time.Duration
-	languageCode  string
-	systemPrompt  string
-	maxTokens     int64
+	// commands is keyed by CommandEntry.Name. resources is keyed by the
+	// Resource name referenced from command entries.
+	commands  map[string]CommandEntry
+	resources map[string]resource.Resource
+
+	wakeWord       string
+	wakeCooldown   time.Duration
+	languageCode   string
+	systemPrompt   string
+	maxTokens      int64
 	anthropicModel anthropic.Model
 
 	speechClient    *speech.Client
@@ -127,9 +170,19 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	if err != nil {
 		return nil, fmt.Errorf("text_to_speech %q not found: %w", conf.TextToSpeechName, err)
 	}
-	target, err := deps.Lookup(generic.Named(conf.TargetServiceName))
-	if err != nil {
-		return nil, fmt.Errorf("target_service %q not found: %w", conf.TargetServiceName, err)
+
+	commands := make(map[string]CommandEntry, len(conf.Commands))
+	resources := map[string]resource.Resource{}
+	for _, c := range conf.Commands {
+		commands[c.Name] = c
+		if _, ok := resources[c.Resource]; ok {
+			continue
+		}
+		res, err := deps.Lookup(generic.Named(c.Resource))
+		if err != nil {
+			return nil, fmt.Errorf("command %q: resource %q not found: %w", c.Name, c.Resource, err)
+		}
+		resources[c.Resource] = res
 	}
 
 	credBytes, err := json.Marshal(conf.GoogleCredJSON)
@@ -164,17 +217,20 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		model = anthropic.Model("claude-opus-4-7")
 	}
 
+	systemPrompt := buildSystemPrompt(conf.Commands, conf.SystemPrompt)
+	logger.Debugw("built system prompt", "prompt", systemPrompt)
+
 	s := &service{
 		name:            name,
 		logger:          logger,
 		mic:             mic,
 		tts:             tts,
-		target:          target,
-		targetCmdKey:    conf.TargetCommandKey,
+		commands:        commands,
+		resources:       resources,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		languageCode:    lang,
-		systemPrompt:    conf.SystemPrompt,
+		systemPrompt:    systemPrompt,
 		maxTokens:       maxTokens,
 		anthropicModel:  model,
 		speechClient:    speechClient,
@@ -186,29 +242,49 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	return s, nil
 }
 
+// buildSystemPrompt assembles the system prompt Claude sees on every call.
+// The auto-generated header stays in sync with the configured command list,
+// so drift between config and prompt is impossible. The user-supplied
+// suffix (Config.SystemPrompt) carries tone/style, not domain knowledge.
+func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
+	var b strings.Builder
+	b.WriteString("You are a voice-controlled assistant. A customer just spoke to you. Pick at most one of the following commands to dispatch, and produce a short spoken reply.\n\n")
+	b.WriteString("Available commands:\n")
+	for _, c := range cmds {
+		fmt.Fprintf(&b, "- %q — %s\n", c.Name, c.Description)
+	}
+	b.WriteString("\nRespond with exactly one JSON object and nothing else. No prose before or after, no markdown code fences:\n\n")
+	b.WriteString("{ \"response\": \"<one short sentence to say to the customer>\", \"command\": \"<name from the list, or null>\" }\n\n")
+	b.WriteString("If the utterance doesn't clearly match any command, set \"command\" to null and use \"response\" to politely ask for clarification or decline.")
+	if strings.TrimSpace(userSuffix) != "" {
+		b.WriteString("\n\n")
+		b.WriteString(strings.TrimSpace(userSuffix))
+	}
+	return b.String()
+}
+
 func (s *service) Name() resource.Name { return s.name }
 
 func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	names := make([]string, 0, len(s.commands))
+	for n := range s.commands {
+		names = append(names, n)
+	}
+	sort.Strings(names)
 	return map[string]interface{}{
 		"wake_word": s.wakeWord,
 		"last_wake": s.lastWake.Format(time.RFC3339Nano),
 		"llm_model": string(s.anthropicModel),
 		"language":  s.languageCode,
+		"commands":  names,
 	}, nil
 }
 
 func (s *service) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if _, ok := cmd["status"]; ok {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return map[string]interface{}{
-			"wake_word":   s.wakeWord,
-			"last_wake":   s.lastWake.Format(time.RFC3339Nano),
-			"llm_model":   string(s.anthropicModel),
-			"language":    s.languageCode,
-		}, nil
+		return s.Status(ctx)
 	}
 	return nil, fmt.Errorf("unknown command; supported: status")
 }
@@ -225,8 +301,8 @@ func (s *service) Close(ctx context.Context) error {
 }
 
 // run is the top-level listening loop. Each iteration opens a fresh STT
-// streaming session, waits for a wake-word + utterance, processes the order,
-// speaks the reply, and loops back.
+// streaming session, waits for a wake-word + utterance, classifies it with
+// the LLM, dispatches the matched command (if any), and speaks the reply.
 func (s *service) run() {
 	defer s.workerWG.Done()
 	for s.workerCtx.Err() == nil {
@@ -263,9 +339,9 @@ func (s *service) run() {
 		if reply.Response != "" {
 			s.speak(s.workerCtx, reply.Response)
 		}
-		if reply.Order != nil {
-			if err := s.dispatchOrder(s.workerCtx, reply.Order); err != nil {
-				s.logger.Errorw("dispatch order failed", "err", err, "order", reply.Order)
+		if reply.Command != "" {
+			if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
+				s.logger.Errorw("dispatch failed", "err", err, "command", reply.Command)
 			}
 		}
 	}
@@ -446,10 +522,11 @@ func stateName(s state) string {
 	return "unknown"
 }
 
-// interpretedReply is what the LLM is asked to return.
+// interpretedReply is what the LLM is asked to return. Command is the Name
+// of a configured CommandEntry, or empty / null for "no action."
 type interpretedReply struct {
-	Order    map[string]interface{} `json:"order"`
-	Response string                 `json:"response"`
+	Response string `json:"response"`
+	Command  string `json:"command"`
 }
 
 func (s *service) interpret(ctx context.Context, utterance string) (interpretedReply, error) {
@@ -486,7 +563,7 @@ func (s *service) interpret(ctx context.Context, utterance string) (interpretedR
 	var reply interpretedReply
 	if err := json.Unmarshal([]byte(body), &reply); err != nil {
 		// Fallback: treat the whole text as the spoken response and emit no
-		// order. Better than a failed turn.
+		// command. Better than a failed turn.
 		return interpretedReply{Response: raw}, nil
 	}
 	return reply, nil
@@ -501,8 +578,27 @@ func (s *service) speak(ctx context.Context, text string) {
 	}
 }
 
-func (s *service) dispatchOrder(ctx context.Context, order map[string]interface{}) error {
-	_, err := s.target.DoCommand(ctx, map[string]interface{}{s.targetCmdKey: order})
+// dispatch looks up the named CommandEntry and fires its DoCommand payload at
+// the pre-resolved target resource. Unknown command names are a soft error:
+// we log and return nil so a hallucinated name doesn't break the listening
+// loop.
+func (s *service) dispatch(ctx context.Context, commandName string) error {
+	entry, ok := s.commands[commandName]
+	if !ok {
+		s.logger.Warnw("llm chose unknown command; skipping dispatch", "command", commandName)
+		return nil
+	}
+	target, ok := s.resources[entry.Resource]
+	if !ok {
+		// Should be unreachable — Validate + New ensure every entry's
+		// Resource is in the map. Defensive log.
+		return fmt.Errorf("resource %q for command %q missing from resource map", entry.Resource, commandName)
+	}
+	s.logger.Infow("dispatching command",
+		"command", commandName,
+		"resource", entry.Resource,
+		"payload", entry.DoCommand)
+	_, err := target.DoCommand(ctx, entry.DoCommand)
 	return err
 }
 
