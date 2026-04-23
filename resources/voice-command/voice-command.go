@@ -482,6 +482,13 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 		return "", fmt.Errorf("open STT stream: %w", err)
 	}
 	// Send config first.
+	// Enable Google's single_utterance mode so the server closes the stream
+	// as soon as it detects end-of-speech (~200-500ms of silence). Applies
+	// to both wake-triggered and conversation follow-ups for consistent,
+	// snappy turn-taking. Trade-off in wake mode: the user has to say the
+	// wake word and their command in one breath — a long pause after the
+	// wake word will close the stream early. In practice that's fine, and
+	// it keeps latency low in both modes.
 	if err := sttStream.Send(&speechpb.StreamingRecognizeRequest{
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 			StreamingConfig: &speechpb.StreamingRecognitionConfig{
@@ -491,7 +498,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 					LanguageCode:    s.languageCode,
 				},
 				InterimResults:  true,
-				SingleUtterance: false,
+				SingleUtterance: true,
 			},
 		},
 	}); err != nil {
