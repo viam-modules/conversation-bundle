@@ -61,10 +61,12 @@ type Config struct {
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
 
-	// ConversationTimeoutSec is how long to stay in conversation mode
-	// (accepting follow-ups without a wake word) after Claude sets
-	// continue_conversation=true on a reply. Default 12 seconds.
-	ConversationTimeoutSec float64 `json:"conversation_timeout_sec,omitempty"`
+	// ListenTimeoutSec caps how long we wait for the user's utterance
+	// once we've begun actively listening — either right after wake-word
+	// detection (wake mode) or throughout a conversation follow-up
+	// (conversation mode). If the user stays silent for this long, we
+	// stop listening and return to idle. Default 7 seconds.
+	ListenTimeoutSec float64 `json:"listen_timeout_sec,omitempty"`
 
 	// MaxUtteranceWords caps how many words we accumulate (post-wake-word
 	// in wake mode, whole transcript in conversation mode) before we stop
@@ -72,6 +74,13 @@ type Config struct {
 	// to the LLM. Keeps latency bounded in noisy rooms where ambient
 	// chatter keeps the utterance window open indefinitely. Default 10.
 	MaxUtteranceWords int `json:"max_utterance_words,omitempty"`
+
+	// ConversationEndCue is spoken when an active conversation window ends
+	// (either because Claude signaled end or the timer expired) to remind
+	// the user they'll need to say the wake word to re-engage. Omit the
+	// field to use the default (a reminder naming the wake word); set it
+	// to an empty string to suppress the cue entirely.
+	ConversationEndCue *string `json:"conversation_end_cue,omitempty"`
 
 	GoogleCredJSON map[string]interface{} `json:"google_credentials_json"`
 	LanguageCode   string                 `json:"language_code,omitempty"`
@@ -151,8 +160,9 @@ type service struct {
 
 	wakeWord       string
 	wakeCooldown   time.Duration
-	convoTimeout   time.Duration
+	listenTimeout   time.Duration
 	maxWords       int
+	endCue         string
 	languageCode   string
 	systemPrompt   string
 	maxTokens      int64
@@ -227,13 +237,20 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	if cooldown <= 0 {
 		cooldown = 2 * time.Second
 	}
-	convoTimeout := time.Duration(conf.ConversationTimeoutSec * float64(time.Second))
-	if convoTimeout <= 0 {
-		convoTimeout = 12 * time.Second
+	listenTimeout := time.Duration(conf.ListenTimeoutSec * float64(time.Second))
+	if listenTimeout <= 0 {
+		listenTimeout = 7 * time.Second
 	}
 	maxWords := conf.MaxUtteranceWords
 	if maxWords <= 0 {
 		maxWords = 10
+	}
+	// Omitted = default cue naming the wake word; explicit "" = suppress.
+	var endCue string
+	if conf.ConversationEndCue == nil {
+		endCue = fmt.Sprintf("Say %s when you need me.", wake)
+	} else {
+		endCue = *conf.ConversationEndCue
 	}
 	lang := conf.LanguageCode
 	if lang == "" {
@@ -260,8 +277,9 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		resources:       resources,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
-		convoTimeout:    convoTimeout,
+		listenTimeout:    listenTimeout,
 		maxWords:        maxWords,
+		endCue:          endCue,
 		languageCode:    lang,
 		systemPrompt:    systemPrompt,
 		maxTokens:       maxTokens,
@@ -361,7 +379,7 @@ func (s *service) inConversation() (history []anthropic.MessageParam, deadline t
 func (s *service) extendConversation(history []anthropic.MessageParam) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.convoExpiresAt = time.Now().Add(s.convoTimeout)
+	s.convoExpiresAt = time.Now().Add(s.listenTimeout)
 	s.convoHistory = history
 }
 
@@ -400,6 +418,7 @@ func (s *service) run() {
 			// timed out without a follow-up. End the conversation cleanly.
 			if inConvo && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded")) {
 				s.logger.Infow("conversation window timed out; returning to wake-word mode")
+				s.speakEndCue(s.workerCtx)
 				s.endConversation()
 				continue
 			}
@@ -446,9 +465,25 @@ func (s *service) run() {
 		if reply.ContinueConversation {
 			s.extendConversation(newHistory)
 		} else {
+			// Play the wake-word reminder on every end-of-turn that
+			// doesn't continue the conversation — covers both the
+			// "one-shot wake-triggered turn" and "conversation ending
+			// after multiple turns" cases, so the user always knows the
+			// robot is idle and waiting for the next wake word.
+			s.speakEndCue(s.workerCtx)
 			s.endConversation()
 		}
 	}
+}
+
+// speakEndCue plays the configured wake-word reminder, if any, to let the
+// user know the conversation window has closed. No-op if the cue was set
+// to an empty string in config.
+func (s *service) speakEndCue(ctx context.Context) {
+	if s.endCue == "" {
+		return
+	}
+	s.speak(ctx, s.endCue)
 }
 
 // listenForCommand opens a Google STT streaming session, pipes mic audio
@@ -477,18 +512,24 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	}
 	sampleRate := first.AudioInfo.SampleRateHz
 
-	sttStream, err := s.speechClient.StreamingRecognize(ctx)
+	// Open the STT stream under a cancellable child context so we can
+	// enforce the listen-timeout by closing the stream from under Recv.
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
+	sttStream, err := s.speechClient.StreamingRecognize(streamCtx)
 	if err != nil {
 		return "", fmt.Errorf("open STT stream: %w", err)
 	}
 	// Send config first.
-	// Enable Google's single_utterance mode so the server closes the stream
-	// as soon as it detects end-of-speech (~200-500ms of silence). Applies
-	// to both wake-triggered and conversation follow-ups for consistent,
-	// snappy turn-taking. Trade-off in wake mode: the user has to say the
-	// wake word and their command in one breath — a long pause after the
-	// wake word will close the stream early. In practice that's fine, and
-	// it keeps latency low in both modes.
+	// Only enable Google's single_utterance mode in conversation follow-up
+	// mode. There, it gives snappy turn-taking (~200-500ms after the user
+	// stops talking). In wake mode we keep it OFF — otherwise every
+	// ambient utterance from colleagues in the room terminates our STT
+	// stream, forcing a ~4s reopen cycle during which we can't hear the
+	// wake word. With single_utterance off, the stream stays open until
+	// we close it (or the 305s limit); wake-mode latency is then capped
+	// by our own listen-timeout (after wake-word detection) and the
+	// max-utterance-words cap.
 	if err := sttStream.Send(&speechpb.StreamingRecognizeRequest{
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 			StreamingConfig: &speechpb.StreamingRecognitionConfig{
@@ -498,7 +539,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 					LanguageCode:    s.languageCode,
 				},
 				InterimResults:  true,
-				SingleUtterance: true,
+				SingleUtterance: startInConversation,
 			},
 		},
 	}); err != nil {
@@ -545,7 +586,25 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	}
 	var captureBuf strings.Builder
 
+	// Listen-timeout timer: once we're in stateListening, the user has
+	// listenTimeout to finish speaking. If the timer fires, we cancel
+	// streamCtx, which makes Recv return a cancellation error that we
+	// translate into a clean return with whatever we've captured.
+	var listenTimer *time.Timer
+	armListenTimeout := func() {
+		if listenTimer != nil {
+			return
+		}
+		listenTimer = time.AfterFunc(s.listenTimeout, streamCancel)
+	}
+	if startInConversation {
+		armListenTimeout()
+	}
+
 	defer func() {
+		if listenTimer != nil {
+			listenTimer.Stop()
+		}
 		pipeCancel()
 		_ = sttStream.CloseSend()
 		pipeWG.Wait()
@@ -557,6 +616,15 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 			return "", nil
 		}
 		if err != nil {
+			// If this error is due to our own listen-timeout cancelling
+			// streamCtx (and the outer ctx is still alive), treat it as a
+			// normal timeout: return whatever we captured without an error.
+			if streamCtx.Err() != nil && ctx.Err() == nil {
+				s.logger.Infow("listen timeout fired",
+					"state", stateName(state),
+					"captured", captureBuf.String())
+				return strings.TrimSpace(captureBuf.String()), nil
+			}
 			return "", fmt.Errorf("STT recv: %w", err)
 		}
 		for _, result := range resp.Results {
@@ -586,6 +654,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				s.mu.Unlock()
 				s.logger.Infow("wake word detected", "transcript", transcript)
 				state = stateListening
+				armListenTimeout()
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
 				// Short-circuit if we've already got enough to work with:
 				// Google marked it final, OR the post-wake portion already
@@ -613,6 +682,14 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 					post = strings.TrimSpace(trimmed[idx+len(s.wakeWord):])
 				} else {
 					post = trimmed
+				}
+
+				// Keep captureBuf in sync with the latest interim so the
+				// listen-timeout path has something to return if the timer
+				// fires while the user is still mid-sentence.
+				if post != "" {
+					captureBuf.Reset()
+					captureBuf.WriteString(post)
 				}
 
 				// Cut early on word count: once we've heard at least
