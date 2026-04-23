@@ -65,6 +65,13 @@ type Config struct {
 	// continue_conversation=true on a reply. Default 12 seconds.
 	ConversationTimeoutSec float64 `json:"conversation_timeout_sec,omitempty"`
 
+	// MaxUtteranceWords caps how many words we accumulate (post-wake-word
+	// in wake mode, whole transcript in conversation mode) before we stop
+	// waiting for Google STT's is_final and commit the partial transcript
+	// to the LLM. Keeps latency bounded in noisy rooms where ambient
+	// chatter keeps the utterance window open indefinitely. Default 10.
+	MaxUtteranceWords int `json:"max_utterance_words,omitempty"`
+
 	GoogleCredJSON map[string]interface{} `json:"google_credentials_json"`
 	LanguageCode   string                 `json:"language_code,omitempty"`
 
@@ -144,6 +151,7 @@ type service struct {
 	wakeWord        string
 	wakeCooldown    time.Duration
 	convoTimeout    time.Duration
+	maxWords        int
 	languageCode    string
 	systemPrompt    string
 	maxTokens       int64
@@ -220,6 +228,10 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	if convoTimeout <= 0 {
 		convoTimeout = 12 * time.Second
 	}
+	maxWords := conf.MaxUtteranceWords
+	if maxWords <= 0 {
+		maxWords = 10
+	}
 	lang := conf.LanguageCode
 	if lang == "" {
 		lang = "en-US"
@@ -246,6 +258,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		convoTimeout:    convoTimeout,
+		maxWords:        maxWords,
 		languageCode:    lang,
 		systemPrompt:    systemPrompt,
 		maxTokens:       maxTokens,
@@ -272,14 +285,15 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	}
 	b.WriteString("\nRespond with exactly one JSON object and nothing else. No prose before or after, no markdown code fences:\n\n")
 	b.WriteString("{\n")
-	b.WriteString("  \"response\": \"<one short sentence to say to the customer, or an empty string to stay silent>\",\n")
+	b.WriteString("  \"response\": \"<a short friendly sentence to say to the customer>\",\n")
 	b.WriteString("  \"command\": \"<name from the list, or null>\",\n")
 	b.WriteString("  \"continue_conversation\": <true or false>\n")
 	b.WriteString("}\n\n")
 	b.WriteString("Rules:\n")
-	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null.\n")
-	b.WriteString("- Set \"continue_conversation\" to true when you expect the customer to reply — you asked a clarifying question, or they're mid-order and likely to add more. Set false when the exchange is complete (e.g., order placed, farewell).\n")
-	b.WriteString("- If the utterance appears to be ambient conversation not directed at you (someone else talking nearby), set \"response\" to an empty string and \"continue_conversation\" to true to silently keep listening.\n")
+	b.WriteString("- Always produce a non-empty \"response\". Every turn gets a spoken reply — confirmations, acknowledgments, thank-yous, farewells, or even a good-natured \"sorry, didn't catch that\" for vague input. Never return an empty string.\n")
+	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null and still say something natural in \"response\".\n")
+	b.WriteString("- Set \"continue_conversation\" to true when you expect the customer to reply — you asked a clarifying question, they're mid-order, or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., order placed and confirmed, explicit farewell). Err on the side of true if unsure, so customers can chime back in.\n")
+	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
@@ -561,11 +575,14 @@ func (s *service) listenForOrder(ctx context.Context, startInConversation bool) 
 				s.mu.Unlock()
 				s.logger.Infow("wake word detected", "transcript", transcript)
 				state = stateListening
-				// If this is already a final result carrying the post-wake
-				// order ("hey beanjamin, espresso please"), short-circuit and
-				// return it now.
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
-				if result.IsFinal && after != "" {
+				// Short-circuit if we've already got enough to work with:
+				// Google marked it final, OR the post-wake portion already
+				// carries at least maxWords. Both keep us from waiting on
+				// ambient chatter to finish.
+				if after != "" && (result.IsFinal || wordCount(after) >= s.maxWords) {
+					s.logger.Infow("committing utterance (wake-word short-circuit)",
+						"is_final", result.IsFinal, "word_count", wordCount(after))
 					return after, nil
 				}
 				if after != "" {
@@ -573,30 +590,33 @@ func (s *service) listenForOrder(ctx context.Context, startInConversation bool) 
 					orderText.WriteString(after)
 				}
 			case stateListening:
+				trimmed := strings.TrimSpace(transcript)
+
+				// Compute the post-wake portion (in wake mode) or the whole
+				// transcript (in conversation mode) — this is what we'd
+				// ultimately hand to the LLM.
+				var post string
+				if startInConversation {
+					post = trimmed
+				} else if idx := strings.LastIndex(strings.ToLower(trimmed), s.wakeWord); idx >= 0 {
+					post = strings.TrimSpace(trimmed[idx+len(s.wakeWord):])
+				} else {
+					post = trimmed
+				}
+
+				// Cut early on word count: once we've heard at least
+				// maxWords of content post-wake, commit without waiting
+				// for Google's is_final (which may be blocked indefinitely
+				// by ambient chatter in noisy rooms).
+				if post != "" && wordCount(post) >= s.maxWords {
+					s.logger.Infow("committing utterance (word-count cap)",
+						"word_count", wordCount(post), "cap", s.maxWords)
+					return post, nil
+				}
+
 				if result.IsFinal {
-					trimmed := strings.TrimSpace(transcript)
-					// In conversation mode there's no wake word to strip —
-					// the final transcript is the user's whole reply.
-					if startInConversation {
-						if trimmed != "" {
-							return trimmed, nil
-						}
-						return strings.TrimSpace(orderText.String()), nil
-					}
-					// Wake-word mode: strip the wake word (and anything before
-					// it) from the final transcript. In a noisy room Google
-					// STT glues ambient chatter into the same utterance
-					// window, so "...orientation vector hey benjamin can I
-					// have an espresso" needs to become just "can I have an
-					// espresso" before we hand it to the LLM.
-					if idx := strings.LastIndex(strings.ToLower(trimmed), s.wakeWord); idx >= 0 {
-						after := strings.TrimSpace(trimmed[idx+len(s.wakeWord):])
-						if after != "" {
-							return after, nil
-						}
-					}
-					if trimmed != "" {
-						return trimmed, nil
+					if post != "" {
+						return post, nil
 					}
 					return strings.TrimSpace(orderText.String()), nil
 				}
@@ -710,6 +730,12 @@ func (s *service) dispatch(ctx context.Context, commandName string) error {
 		"payload", entry.DoCommand)
 	_, err := target.DoCommand(ctx, entry.DoCommand)
 	return err
+}
+
+// wordCount counts whitespace-separated tokens. Good enough for the
+// commit-early heuristic; we're not doing linguistics.
+func wordCount(s string) int {
+	return len(strings.Fields(s))
 }
 
 // stripCodeFence removes a surrounding ```…``` fence (with or without a
