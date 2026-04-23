@@ -14,7 +14,7 @@
     {
       "api": "rdk:service:generic",
       "model": "viam:conversation-bundle:voice-command",
-      "short_description": "Voice-command orchestrator: wake word + Google STT + Claude + TTS, classifies utterances against a configured list of commands and dispatches via DoCommand to target resources.",
+      "short_description": "Wake-word + STT + Claude + TTS orchestrator with configurable DoCommand targets.",
       "markdown_link": "README.md#model-viamconversation-bundlevoice-command"
     }
   ],
