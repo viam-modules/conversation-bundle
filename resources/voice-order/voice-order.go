@@ -8,6 +8,7 @@ package voiceorder
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -58,6 +59,11 @@ type Config struct {
 
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
+
+	// ConversationTimeoutSec is how long to stay in conversation mode
+	// (accepting follow-ups without a wake word) after Claude sets
+	// continue_conversation=true on a reply. Default 12 seconds.
+	ConversationTimeoutSec float64 `json:"conversation_timeout_sec,omitempty"`
 
 	GoogleCredJSON map[string]interface{} `json:"google_credentials_json"`
 	LanguageCode   string                 `json:"language_code,omitempty"`
@@ -135,12 +141,13 @@ type service struct {
 	commands  map[string]CommandEntry
 	resources map[string]resource.Resource
 
-	wakeWord       string
-	wakeCooldown   time.Duration
-	languageCode   string
-	systemPrompt   string
-	maxTokens      int64
-	anthropicModel anthropic.Model
+	wakeWord        string
+	wakeCooldown    time.Duration
+	convoTimeout    time.Duration
+	languageCode    string
+	systemPrompt    string
+	maxTokens       int64
+	anthropicModel  anthropic.Model
 
 	speechClient    *speech.Client
 	anthropicClient anthropic.Client
@@ -151,6 +158,11 @@ type service struct {
 
 	mu       sync.Mutex
 	lastWake time.Time
+	// convoExpiresAt is non-zero while a conversation window is open.
+	// During the window, voice-order skips wake-word gating and passes
+	// convoHistory to the LLM so follow-up utterances carry context.
+	convoExpiresAt time.Time
+	convoHistory   []anthropic.MessageParam
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -204,6 +216,10 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	if cooldown <= 0 {
 		cooldown = 2 * time.Second
 	}
+	convoTimeout := time.Duration(conf.ConversationTimeoutSec * float64(time.Second))
+	if convoTimeout <= 0 {
+		convoTimeout = 12 * time.Second
+	}
 	lang := conf.LanguageCode
 	if lang == "" {
 		lang = "en-US"
@@ -229,6 +245,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		resources:       resources,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
+		convoTimeout:    convoTimeout,
 		languageCode:    lang,
 		systemPrompt:    systemPrompt,
 		maxTokens:       maxTokens,
@@ -254,8 +271,16 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 		fmt.Fprintf(&b, "- %q — %s\n", c.Name, c.Description)
 	}
 	b.WriteString("\nRespond with exactly one JSON object and nothing else. No prose before or after, no markdown code fences:\n\n")
-	b.WriteString("{ \"response\": \"<one short sentence to say to the customer>\", \"command\": \"<name from the list, or null>\" }\n\n")
-	b.WriteString("If the utterance doesn't clearly match any command, set \"command\" to null and use \"response\" to politely ask for clarification or decline.")
+	b.WriteString("{\n")
+	b.WriteString("  \"response\": \"<one short sentence to say to the customer, or an empty string to stay silent>\",\n")
+	b.WriteString("  \"command\": \"<name from the list, or null>\",\n")
+	b.WriteString("  \"continue_conversation\": <true or false>\n")
+	b.WriteString("}\n\n")
+	b.WriteString("Rules:\n")
+	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null.\n")
+	b.WriteString("- Set \"continue_conversation\" to true when you expect the customer to reply — you asked a clarifying question, or they're mid-order and likely to add more. Set false when the exchange is complete (e.g., order placed, farewell).\n")
+	b.WriteString("- If the utterance appears to be ambient conversation not directed at you (someone else talking nearby), set \"response\" to an empty string and \"continue_conversation\" to true to silently keep listening.\n")
+	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -300,16 +325,66 @@ func (s *service) Close(ctx context.Context) error {
 	return nil
 }
 
+// inConversation reports whether a conversation window is currently open.
+// Returns the history to thread into the next LLM call and the deadline by
+// which the next utterance must arrive. When not in a conversation, history
+// is nil and deadline is the zero time.
+func (s *service) inConversation() (history []anthropic.MessageParam, deadline time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.convoExpiresAt.IsZero() || time.Now().After(s.convoExpiresAt) {
+		return nil, time.Time{}
+	}
+	// Return a copy so callers don't see concurrent appends.
+	h := make([]anthropic.MessageParam, len(s.convoHistory))
+	copy(h, s.convoHistory)
+	return h, s.convoExpiresAt
+}
+
+func (s *service) extendConversation(history []anthropic.MessageParam) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.convoExpiresAt = time.Now().Add(s.convoTimeout)
+	s.convoHistory = history
+}
+
+func (s *service) endConversation() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.convoExpiresAt = time.Time{}
+	s.convoHistory = nil
+}
+
 // run is the top-level listening loop. Each iteration opens a fresh STT
-// streaming session, waits for a wake-word + utterance, classifies it with
-// the LLM, dispatches the matched command (if any), and speaks the reply.
+// streaming session, waits for either a wake-word + utterance (idle mode)
+// or any utterance (conversation mode), classifies it with the LLM,
+// dispatches the matched command (if any), and speaks the reply.
 func (s *service) run() {
 	defer s.workerWG.Done()
 	for s.workerCtx.Err() == nil {
-		utterance, err := s.listenForOrder(s.workerCtx)
+		history, deadline := s.inConversation()
+		inConvo := !deadline.IsZero()
+
+		listenCtx := s.workerCtx
+		var cancel context.CancelFunc
+		if inConvo {
+			listenCtx, cancel = context.WithDeadline(s.workerCtx, deadline)
+		}
+		utterance, err := s.listenForOrder(listenCtx, inConvo)
+		if cancel != nil {
+			cancel()
+		}
+
 		if err != nil {
 			if s.workerCtx.Err() != nil {
 				return
+			}
+			// In conversation mode, a deadline-exceeded just means the window
+			// timed out without a follow-up. End the conversation cleanly.
+			if inConvo && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded")) {
+				s.logger.Infow("conversation window timed out; returning to wake-word mode")
+				s.endConversation()
+				continue
 			}
 			// Google STT caps streaming sessions at 305s. The outer loop
 			// reopens a fresh stream on the next iteration, so this is
@@ -329,13 +404,20 @@ func (s *service) run() {
 		if utterance == "" {
 			continue
 		}
-		s.logger.Infow("captured utterance", "text", utterance)
-		reply, err := s.interpret(s.workerCtx, utterance)
+		s.logger.Infow("captured utterance", "text", utterance, "in_conversation", inConvo)
+
+		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
 		if err != nil {
 			s.logger.Errorw("llm interpret failed", "err", err)
 			s.speak(s.workerCtx, "Sorry, I had trouble understanding that. Could you try again?")
+			s.endConversation()
 			continue
 		}
+		s.logger.Infow("llm decision",
+			"command", reply.Command,
+			"continue_conversation", reply.ContinueConversation,
+			"response", reply.Response)
+
 		if reply.Response != "" {
 			s.speak(s.workerCtx, reply.Response)
 		}
@@ -344,13 +426,18 @@ func (s *service) run() {
 				s.logger.Errorw("dispatch failed", "err", err, "command", reply.Command)
 			}
 		}
+		if reply.ContinueConversation {
+			s.extendConversation(newHistory)
+		} else {
+			s.endConversation()
+		}
 	}
 }
 
 // listenForOrder opens a Google STT streaming session, pipes mic audio to it,
-// waits for the wake word in a live transcript, then returns the remainder of
-// that utterance once Google marks it final.
-func (s *service) listenForOrder(ctx context.Context) (string, error) {
+// waits for the wake word (or any utterance if startInConversation is true),
+// and returns the captured utterance once Google marks it final.
+func (s *service) listenForOrder(ctx context.Context, startInConversation bool) (string, error) {
 	chunks, err := s.mic.GetAudio(ctx, "pcm16", 0, 0, nil)
 	if err != nil {
 		return "", fmt.Errorf("open mic: %w", err)
@@ -424,8 +511,13 @@ func (s *service) listenForOrder(ctx context.Context) (string, error) {
 		}
 	}()
 
-	// State machine on STT responses.
+	// State machine on STT responses. In conversation mode we skip
+	// wake-word gating entirely — the next final transcript is the
+	// user's follow-up.
 	state := stateIdle
+	if startInConversation {
+		state = stateListening
+	}
 	var orderText strings.Builder
 
 	defer func() {
@@ -482,13 +574,21 @@ func (s *service) listenForOrder(ctx context.Context) (string, error) {
 				}
 			case stateListening:
 				if result.IsFinal {
-					// Strip the wake word (and anything before it) from the
-					// final transcript. In a noisy room Google STT glues
-					// ambient chatter into the same utterance window, so
-					// "...orientation vector hey benjamin can I have an
-					// espresso" needs to become just "can I have an espresso"
-					// before we hand it to the LLM.
 					trimmed := strings.TrimSpace(transcript)
+					// In conversation mode there's no wake word to strip —
+					// the final transcript is the user's whole reply.
+					if startInConversation {
+						if trimmed != "" {
+							return trimmed, nil
+						}
+						return strings.TrimSpace(orderText.String()), nil
+					}
+					// Wake-word mode: strip the wake word (and anything before
+					// it) from the final transcript. In a noisy room Google
+					// STT glues ambient chatter into the same utterance
+					// window, so "...orientation vector hey benjamin can I
+					// have an espresso" needs to become just "can I have an
+					// espresso" before we hand it to the LLM.
 					if idx := strings.LastIndex(strings.ToLower(trimmed), s.wakeWord); idx >= 0 {
 						after := strings.TrimSpace(trimmed[idx+len(s.wakeWord):])
 						if after != "" {
@@ -525,11 +625,20 @@ func stateName(s state) string {
 // interpretedReply is what the LLM is asked to return. Command is the Name
 // of a configured CommandEntry, or empty / null for "no action."
 type interpretedReply struct {
-	Response string `json:"response"`
-	Command  string `json:"command"`
+	Response             string `json:"response"`
+	Command              string `json:"command"`
+	ContinueConversation bool   `json:"continue_conversation"`
 }
 
-func (s *service) interpret(ctx context.Context, utterance string) (interpretedReply, error) {
+// interpret sends the utterance (with optional prior conversation history)
+// to Claude and returns the parsed reply plus the history extended with
+// this turn's user and assistant messages. Callers can thread the returned
+// history back into the next interpret() call to maintain context across
+// a conversation window.
+func (s *service) interpret(ctx context.Context, utterance string, history []anthropic.MessageParam) (interpretedReply, []anthropic.MessageParam, error) {
+	userMsg := anthropic.NewUserMessage(anthropic.NewTextBlock(utterance))
+	msgs := append(append([]anthropic.MessageParam{}, history...), userMsg)
+
 	msg, err := s.anthropicClient.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     s.anthropicModel,
 		MaxTokens: s.maxTokens,
@@ -537,12 +646,10 @@ func (s *service) interpret(ctx context.Context, utterance string) (interpretedR
 			Text:         s.systemPrompt,
 			CacheControl: anthropic.NewCacheControlEphemeralParam(),
 		}},
-		Messages: []anthropic.MessageParam{
-			anthropic.NewUserMessage(anthropic.NewTextBlock(utterance)),
-		},
+		Messages: msgs,
 	})
 	if err != nil {
-		return interpretedReply{}, fmt.Errorf("anthropic messages: %w", err)
+		return interpretedReply{}, history, fmt.Errorf("anthropic messages: %w", err)
 	}
 
 	var text strings.Builder
@@ -555,7 +662,10 @@ func (s *service) interpret(ctx context.Context, utterance string) (interpretedR
 	s.logger.Debugw("llm raw response",
 		"text", raw,
 		"cache_read", msg.Usage.CacheReadInputTokens,
-		"cache_write", msg.Usage.CacheCreationInputTokens)
+		"cache_write", msg.Usage.CacheCreationInputTokens,
+		"history_turns", len(history))
+
+	newHistory := append(msgs, msg.ToParam())
 
 	// Accept the response either as a bare JSON object or as JSON wrapped in
 	// a ```json code fence — Claude sometimes adds one despite instructions.
@@ -564,9 +674,9 @@ func (s *service) interpret(ctx context.Context, utterance string) (interpretedR
 	if err := json.Unmarshal([]byte(body), &reply); err != nil {
 		// Fallback: treat the whole text as the spoken response and emit no
 		// command. Better than a failed turn.
-		return interpretedReply{Response: raw}, nil
+		return interpretedReply{Response: raw}, newHistory, nil
 	}
-	return reply, nil
+	return reply, newHistory, nil
 }
 
 func (s *service) speak(ctx context.Context, text string) {
