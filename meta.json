@@ -10,6 +10,12 @@
       "model": "viam:conversation-bundle:text-to-speech",
       "short_description": "Text-to-speech service using Google Cloud TTS API with audioout playback.",
       "markdown_link": "README.md#model-viamconversation-bundletext-to-speech"
+    },
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:conversation-bundle:voice-command",
+      "short_description": "Voice-command orchestrator: wake word + Google STT + Claude + TTS, classifies utterances against a configured list of commands and dispatches via DoCommand to target resources.",
+      "markdown_link": "README.md#model-viamconversation-bundlevoice-command"
     }
   ],
   "applications": null,

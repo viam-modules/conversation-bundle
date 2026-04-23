@@ -37,3 +37,9 @@ reload-*/
 .claude/worktrees
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Local test configs that may contain secrets (Google creds, API keys)
+local-*.json
+
+# Ad-hoc viam-server log captures (`viam-server ... | tee log`)
+log
