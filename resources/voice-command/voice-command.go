@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	speech "cloud.google.com/go/speech/apiv1"
@@ -121,6 +122,14 @@ type Config struct {
 	// to the LLM. Keeps latency bounded in noisy rooms where ambient
 	// chatter keeps the utterance window open indefinitely. Default 10.
 	MaxUtteranceWords int `json:"max_utterance_words,omitempty"`
+
+	// StableEndpointMs is the client-side silence grace period: once the
+	// captured post-wake (or conversation) content stops changing, we wait
+	// this long before committing — much shorter than Google's ~1-2s
+	// internal VAD. Keeps TTFR low on short utterances like "espresso
+	// please" without closing the STT stream. Default 500ms. Set to a
+	// negative value to disable and fall back to is_final / maxWords only.
+	StableEndpointMs int `json:"stable_endpoint_ms,omitempty"`
 
 	// ConversationEndCue is spoken when an active conversation window ends
 	// (either because Claude signaled end or the timer expired) to remind
@@ -262,6 +271,7 @@ type service struct {
 	wakeCooldown   time.Duration
 	listenTimeout   time.Duration
 	maxWords       int
+	stableEndpoint time.Duration
 	endCue         string
 	minLullPrompts int
 	languageCode   string
@@ -377,6 +387,16 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	if maxWords <= 0 {
 		maxWords = 10
 	}
+	// StableEndpointMs == 0 means unset, use default. Negative disables.
+	var stableEndpoint time.Duration
+	switch {
+	case conf.StableEndpointMs == 0:
+		stableEndpoint = 500 * time.Millisecond
+	case conf.StableEndpointMs < 0:
+		stableEndpoint = 0
+	default:
+		stableEndpoint = time.Duration(conf.StableEndpointMs) * time.Millisecond
+	}
 	// Omitted = default cue naming the wake word; explicit "" = suppress.
 	var endCue string
 	if conf.ConversationEndCue == nil {
@@ -417,6 +437,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		wakeCooldown:    cooldown,
 		listenTimeout:    listenTimeout,
 		maxWords:        maxWords,
+		stableEndpoint:  stableEndpoint,
 		endCue:          endCue,
 		minLullPrompts:  minLullPrompts,
 		languageCode:    lang,
@@ -826,16 +847,51 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	}
 	var captureBuf strings.Builder
 
-	// Listen-timeout timer: once we're in stateListening, the user has
-	// listenTimeout to finish speaking. If the timer fires, we cancel
-	// streamCtx, which makes Recv return a cancellation error that we
-	// translate into a clean return with whatever we've captured.
-	var listenTimer *time.Timer
+	// Two client-side commit triggers both feed into streamCancel; the
+	// Recv error path below distinguishes which one fired via the atomic
+	// flags for telemetry.
+	//
+	// listenTimer: once we're in stateListening, the user has
+	// listenTimeout of total silence before we give up.
+	//
+	// stableTimer: once captured content stops changing, we wait
+	// stableEndpoint before committing — beats Google's ~1-2s internal
+	// VAD on short utterances without closing the stream.
+	var (
+		listenTimer       *time.Timer
+		listenTimerFired  atomic.Bool
+		stableTimer       *time.Timer
+		stableTimerFired  atomic.Bool
+		lastStableContent string
+	)
 	armListenTimeout := func() {
 		if listenTimer != nil {
 			return
 		}
-		listenTimer = time.AfterFunc(s.listenTimeout, streamCancel)
+		listenTimer = time.AfterFunc(s.listenTimeout, func() {
+			listenTimerFired.Store(true)
+			streamCancel()
+		})
+	}
+	// resetStableTimer (re)arms the stable-endpoint timer whenever the
+	// captured content changes. When content is unchanged across
+	// interims, the timer keeps counting down — that's how we detect
+	// "user stopped talking". Content comparison is byte-level so that
+	// Google's occasional backward revisions (e.g. "expression" →
+	// "espresso") also reset the timer.
+	resetStableTimer := func(content string) {
+		if s.stableEndpoint <= 0 || content == "" || content == lastStableContent {
+			return
+		}
+		lastStableContent = content
+		if stableTimer == nil {
+			stableTimer = time.AfterFunc(s.stableEndpoint, func() {
+				stableTimerFired.Store(true)
+				streamCancel()
+			})
+			return
+		}
+		stableTimer.Reset(s.stableEndpoint)
 	}
 	if startInConversation {
 		armListenTimeout()
@@ -844,6 +900,9 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	defer func() {
 		if listenTimer != nil {
 			listenTimer.Stop()
+		}
+		if stableTimer != nil {
+			stableTimer.Stop()
 		}
 		pipeCancel()
 		_ = sttStream.CloseSend()
@@ -856,11 +915,19 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 			return "", nil
 		}
 		if err != nil {
-			// If this error is due to our own listen-timeout cancelling
-			// streamCtx (and the outer ctx is still alive), treat it as a
-			// normal timeout: return whatever we captured without an error.
+			// If this error is due to one of our client-side timers
+			// cancelling streamCtx (and the outer ctx is still alive),
+			// treat it as a normal commit: return whatever we captured
+			// without an error.
 			if streamCtx.Err() != nil && ctx.Err() == nil {
-				s.logger.Infow("listen timeout fired",
+				reason := "stream cancelled"
+				switch {
+				case stableTimerFired.Load():
+					reason = "committing utterance (stable endpoint)"
+				case listenTimerFired.Load():
+					reason = "listen timeout fired"
+				}
+				s.logger.Infow(reason,
 					"state", stateName(state),
 					"captured", captureBuf.String())
 				return strings.TrimSpace(captureBuf.String()), nil
@@ -908,6 +975,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				if after != "" {
 					captureBuf.Reset()
 					captureBuf.WriteString(after)
+					resetStableTimer(after)
 				}
 			case stateListening:
 				trimmed := strings.TrimSpace(transcript)
@@ -926,10 +994,12 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 
 				// Keep captureBuf in sync with the latest interim so the
 				// listen-timeout path has something to return if the timer
-				// fires while the user is still mid-sentence.
+				// fires while the user is still mid-sentence. Also (re)arm
+				// the stable-endpoint timer whenever content changes.
 				if post != "" {
 					captureBuf.Reset()
 					captureBuf.WriteString(post)
+					resetStableTimer(post)
 				}
 
 				// Cut early on word count: once we've heard at least
