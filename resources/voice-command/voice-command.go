@@ -24,6 +24,7 @@ import (
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
 
 	"go.viam.com/rdk/components/audioin"
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	generic "go.viam.com/rdk/services/generic"
@@ -52,11 +53,37 @@ type CommandEntry struct {
 	DoCommand   map[string]interface{} `json:"do_command"`
 }
 
+// SensorEntry declares a Viam sensor resource whose Readings() are
+// fetched fresh on every LLM call and injected into the prompt as a
+// second, uncached system block — so Claude can reason about current
+// state (queue depth, environmental conditions, etc.). Description
+// helps Claude interpret the reading keys.
+type SensorEntry struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// sensorRef is the runtime counterpart to SensorEntry: the resolved
+// sensor.Sensor handle bundled with the metadata needed to format its
+// readings into the prompt.
+type sensorRef struct {
+	name        string
+	description string
+	handle      sensor.Sensor
+}
+
 type Config struct {
 	AudioInName      string `json:"audio_in"`
 	TextToSpeechName string `json:"text_to_speech"`
 
 	Commands []CommandEntry `json:"commands"`
+
+	// Sensors lists Viam sensor resources whose Readings() are fetched
+	// fresh on every LLM call and attached to the request as additional
+	// context. Omit or leave empty for no sensor injection. Fetches run
+	// in parallel and fail soft — if a sensor errors, its slot in the
+	// context reports the error so Claude can react appropriately.
+	Sensors []SensorEntry `json:"sensors,omitempty"`
 
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
@@ -81,6 +108,14 @@ type Config struct {
 	// field to use the default (a reminder naming the wake word); set it
 	// to an empty string to suppress the cue entirely.
 	ConversationEndCue *string `json:"conversation_end_cue,omitempty"`
+
+	// MinLullPrompts is the floor on how many Claude-generated nudge
+	// prompts voice-command will produce on consecutive silences before
+	// honoring Claude's continue_conversation=false signal and closing
+	// the conversation. If Claude sets continue_conversation=false on a
+	// nudge before this floor is reached, voice-command overrides and
+	// keeps the conversation open. Defaults to 2.
+	MinLullPrompts int `json:"min_lull_prompts,omitempty"`
 
 	GoogleCredJSON map[string]interface{} `json:"google_credentials_json"`
 	LanguageCode   string                 `json:"language_code,omitempty"`
@@ -134,6 +169,21 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		resourceSet[c.Resource] = true
 	}
 
+	// Validate sensor entries and build their resource-name list.
+	seenSensors := map[string]bool{}
+	for i, se := range cfg.Sensors {
+		if se.Name == "" {
+			return nil, nil, fmt.Errorf("%s: sensors[%d].name is required", path, i)
+		}
+		if seenSensors[se.Name] {
+			return nil, nil, fmt.Errorf("%s: sensors[%d].name %q is not unique", path, i, se.Name)
+		}
+		seenSensors[se.Name] = true
+		if se.Description == "" {
+			return nil, nil, fmt.Errorf("%s: sensors[%d].description is required", path, i)
+		}
+	}
+
 	deps := []string{cfg.AudioInName, cfg.TextToSpeechName}
 	resources := make([]string, 0, len(resourceSet))
 	for r := range resourceSet {
@@ -141,6 +191,15 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	}
 	sort.Strings(resources)
 	deps = append(deps, resources...)
+	// Sensors are registered under the rdk:component:sensor API, so they
+	// need the full-resource-name form (otherwise the Viam dep resolver
+	// would look up a generic service by that name and fail).
+	sensorNames := make([]string, 0, len(cfg.Sensors))
+	for _, se := range cfg.Sensors {
+		sensorNames = append(sensorNames, sensor.Named(se.Name).String())
+	}
+	sort.Strings(sensorNames)
+	deps = append(deps, sensorNames...)
 	return deps, nil, nil
 }
 
@@ -158,11 +217,16 @@ type service struct {
 	commands  map[string]CommandEntry
 	resources map[string]resource.Resource
 
+	// sensors retains config order so readings in the prompt list in a
+	// stable order (helps Claude's caching of the sensor section).
+	sensors []sensorRef
+
 	wakeWord       string
 	wakeCooldown   time.Duration
 	listenTimeout   time.Duration
 	maxWords       int
 	endCue         string
+	minLullPrompts int
 	languageCode   string
 	systemPrompt   string
 	maxTokens      int64
@@ -182,6 +246,10 @@ type service struct {
 	// convoHistory to the LLM so follow-up utterances carry context.
 	convoExpiresAt time.Time
 	convoHistory   []anthropic.MessageParam
+	// lullCount tracks consecutive silence-triggered nudge prompts within
+	// the current conversation. Resets on a real user utterance and on
+	// endConversation. Used to enforce MinLullPrompts.
+	lullCount int
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -214,6 +282,21 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 			return nil, fmt.Errorf("command %q: resource %q not found: %w", c.Name, c.Resource, err)
 		}
 		resources[c.Resource] = res
+	}
+
+	// Resolve each configured sensor. Preserved in config order so their
+	// readings always appear in a stable order in the prompt.
+	sensors := make([]sensorRef, 0, len(conf.Sensors))
+	for _, se := range conf.Sensors {
+		handle, err := sensor.FromProvider(deps, se.Name)
+		if err != nil {
+			return nil, fmt.Errorf("sensor %q not found: %w", se.Name, err)
+		}
+		sensors = append(sensors, sensorRef{
+			name:        se.Name,
+			description: se.Description,
+			handle:      handle,
+		})
 	}
 
 	credBytes, err := json.Marshal(conf.GoogleCredJSON)
@@ -252,6 +335,10 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	} else {
 		endCue = *conf.ConversationEndCue
 	}
+	minLullPrompts := conf.MinLullPrompts
+	if minLullPrompts <= 0 {
+		minLullPrompts = 2
+	}
 	lang := conf.LanguageCode
 	if lang == "" {
 		lang = "en-US"
@@ -275,11 +362,13 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		tts:             tts,
 		commands:        commands,
 		resources:       resources,
+		sensors:         sensors,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		listenTimeout:    listenTimeout,
 		maxWords:        maxWords,
 		endCue:          endCue,
+		minLullPrompts:  minLullPrompts,
 		languageCode:    lang,
 		systemPrompt:    systemPrompt,
 		maxTokens:       maxTokens,
@@ -315,7 +404,9 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null and still say something natural in \"response\".\n")
 	b.WriteString("- Set \"continue_conversation\" to true when you expect a follow-up — you asked a clarifying question or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., the requested action was confirmed or the user said goodbye). Err on the side of true if unsure, so the user can chime back in.\n")
 	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
-	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.")
+	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
+	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.\n")
+	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -388,6 +479,24 @@ func (s *service) endConversation() {
 	defer s.mu.Unlock()
 	s.convoExpiresAt = time.Time{}
 	s.convoHistory = nil
+	s.lullCount = 0
+}
+
+// resetLullCount marks that the user has engaged (real utterance), so the
+// next silence starts the nudge counter over.
+func (s *service) resetLullCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lullCount = 0
+}
+
+// bumpLullCount increments the consecutive-silence nudge counter and
+// returns the new value.
+func (s *service) bumpLullCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lullCount++
+	return s.lullCount
 }
 
 // run is the top-level listening loop. Each iteration opens a fresh STT
@@ -414,12 +523,13 @@ func (s *service) run() {
 			if s.workerCtx.Err() != nil {
 				return
 			}
-			// In conversation mode, a deadline-exceeded just means the window
-			// timed out without a follow-up. End the conversation cleanly.
+			// In conversation mode, a deadline-exceeded means the user went
+			// silent. Instead of ending the conversation outright, ask
+			// Claude to generate a nudge prompt and keep the window open.
+			// If Claude judges the user has disengaged AND we've hit the
+			// configured minimum number of nudges, we honor that and end.
 			if inConvo && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded")) {
-				s.logger.Infow("conversation window timed out; returning to wake-word mode")
-				s.speakEndCue(s.workerCtx)
-				s.endConversation()
+				s.handleLull(history)
 				continue
 			}
 			// Google STT caps streaming sessions at 305s. The outer loop
@@ -440,6 +550,9 @@ func (s *service) run() {
 		if utterance == "" {
 			continue
 		}
+		// The user said something real — reset the consecutive-silence
+		// counter so future lulls start a fresh budget.
+		s.resetLullCount()
 		s.logger.Infow("captured utterance", "text", utterance, "in_conversation", inConvo)
 
 		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
@@ -484,6 +597,62 @@ func (s *service) speakEndCue(ctx context.Context) {
 		return
 	}
 	s.speak(ctx, s.endCue)
+}
+
+// silenceMarker is the synthetic user-role message voice-command injects
+// into the conversation history when it detects a lull. The system prompt
+// tells Claude to recognize this literal string and respond with a nudge
+// rather than treat it as the user's actual words.
+const silenceMarker = "(the user has gone silent)"
+
+// handleLull runs the lull-prompt flow: ask Claude for a nudge based on
+// current history, speak whatever it returns, dispatch any command it
+// emits, and decide whether to keep the conversation open. If Claude sets
+// continue_conversation=false and we've already produced at least
+// minLullPrompts nudges, we honor that and end; otherwise we override and
+// stay open for another round.
+func (s *service) handleLull(history []anthropic.MessageParam) {
+	s.logger.Infow("conversation lull detected; generating nudge")
+
+	reply, newHistory, err := s.interpret(s.workerCtx, silenceMarker, history)
+	if err != nil {
+		// LLM roundtrip failed — fall back to the old behavior (end cue,
+		// close conversation) rather than spinning on errors.
+		s.logger.Errorw("lull interpret failed; ending conversation", "err", err)
+		s.speakEndCue(s.workerCtx)
+		s.endConversation()
+		return
+	}
+
+	count := s.bumpLullCount()
+	s.logger.Infow("lull decision",
+		"command", reply.Command,
+		"continue_conversation", reply.ContinueConversation,
+		"response", reply.Response,
+		"lull_count", count,
+		"min_lull_prompts", s.minLullPrompts)
+
+	if reply.Response != "" {
+		s.speak(s.workerCtx, reply.Response)
+	}
+	if reply.Command != "" {
+		if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
+			s.logger.Errorw("dispatch failed during lull", "err", err, "command", reply.Command)
+		}
+	}
+
+	// Honor Claude's desire to end only once we've met the minimum budget.
+	// Until then, override and keep the conversation alive.
+	if !reply.ContinueConversation && count >= s.minLullPrompts {
+		s.logger.Infow("ending conversation after lull budget met",
+			"lull_count", count, "min_lull_prompts", s.minLullPrompts)
+		s.speakEndCue(s.workerCtx)
+		s.endConversation()
+		return
+	}
+	// Either Claude wants to keep going, or we're still under the minimum.
+	// Either way, extend the window and loop back to listening.
+	s.extendConversation(newHistory)
 }
 
 // listenForCommand opens a Google STT streaming session, pipes mic audio
@@ -738,6 +907,52 @@ type interpretedReply struct {
 	ContinueConversation bool   `json:"continue_conversation"`
 }
 
+// fetchSensorReadings concurrently invokes Readings() on every configured
+// sensor and returns a map keyed by sensor name. A failure on any one
+// sensor is captured as {"error": "..."} under that sensor's slot so the
+// overall LLM call can still proceed with partial data.
+func (s *service) fetchSensorReadings(ctx context.Context) map[string]interface{} {
+	if len(s.sensors) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(s.sensors))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, sr := range s.sensors {
+		wg.Add(1)
+		go func(sr sensorRef) {
+			defer wg.Done()
+			readings, err := sr.handle.Readings(ctx, nil)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				s.logger.Warnw("sensor readings failed", "sensor", sr.name, "err", err)
+				out[sr.name] = map[string]interface{}{"error": err.Error()}
+				return
+			}
+			out[sr.name] = readings
+		}(sr)
+	}
+	wg.Wait()
+	return out
+}
+
+// sensorContextBlock formats a fresh sensor-readings snapshot as the text
+// of the second (uncached) system block. Called once per interpret() turn.
+func (s *service) sensorContextBlock(ctx context.Context) string {
+	readings := s.fetchSensorReadings(ctx)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Current sensor readings (as of %s):\n", time.Now().UTC().Format(time.RFC3339))
+	for _, sr := range s.sensors {
+		payload, err := json.Marshal(readings[sr.name])
+		if err != nil {
+			payload = []byte(fmt.Sprintf("%q", err.Error()))
+		}
+		fmt.Fprintf(&b, "- %q (%s): %s\n", sr.name, sr.description, payload)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // interpret sends the utterance (with optional prior conversation history)
 // to Claude and returns the parsed reply plus the history extended with
 // this turn's user and assistant messages. Callers can thread the returned
@@ -747,14 +962,25 @@ func (s *service) interpret(ctx context.Context, utterance string, history []ant
 	userMsg := anthropic.NewUserMessage(anthropic.NewTextBlock(utterance))
 	msgs := append(append([]anthropic.MessageParam{}, history...), userMsg)
 
+	// First block: the stable, cached instructions + command list.
+	// Second block (if any sensors configured): fresh-per-turn readings,
+	// uncached, so it can change between calls without invalidating the
+	// cache on the first block.
+	systemBlocks := []anthropic.TextBlockParam{{
+		Text:         s.systemPrompt,
+		CacheControl: anthropic.NewCacheControlEphemeralParam(),
+	}}
+	if len(s.sensors) > 0 {
+		systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
+			Text: s.sensorContextBlock(ctx),
+		})
+	}
+
 	msg, err := s.anthropicClient.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     s.anthropicModel,
 		MaxTokens: s.maxTokens,
-		System: []anthropic.TextBlockParam{{
-			Text:         s.systemPrompt,
-			CacheControl: anthropic.NewCacheControlEphemeralParam(),
-		}},
-		Messages: msgs,
+		System:    systemBlocks,
+		Messages:  msgs,
 	})
 	if err != nil {
 		return interpretedReply{}, history, fmt.Errorf("anthropic messages: %w", err)
