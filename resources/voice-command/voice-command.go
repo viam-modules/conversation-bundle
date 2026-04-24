@@ -72,6 +72,17 @@ type sensorRef struct {
 	handle      sensor.Sensor
 }
 
+// CommandStatusSensorConfig declares a single Viam sensor whose
+// Readings() describe the current state of whatever command
+// voice-command dispatched. Voice-command does not interpret the
+// readings itself — it just injects them into Claude's context under a
+// distinct heading so Claude can factor command progress into its
+// continue_conversation decision.
+type CommandStatusSensorConfig struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
 type Config struct {
 	AudioInName      string `json:"audio_in"`
 	TextToSpeechName string `json:"text_to_speech"`
@@ -84,6 +95,15 @@ type Config struct {
 	// in parallel and fail soft — if a sensor errors, its slot in the
 	// context reports the error so Claude can react appropriately.
 	Sensors []SensorEntry `json:"sensors,omitempty"`
+
+	// CommandStatusSensor is an optional designated sensor whose Readings()
+	// report the state of the last-dispatched command (e.g., whether it's
+	// still running, queue depth, result so far). Readings are included in
+	// Claude's context every turn under a separate heading so Claude can
+	// factor command progress into its continue_conversation decision —
+	// for example, keeping the conversation open while a brew is in
+	// progress. Voice-command does not interpret the readings itself.
+	CommandStatusSensor *CommandStatusSensorConfig `json:"command_status_sensor,omitempty"`
 
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
@@ -183,6 +203,14 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 			return nil, nil, fmt.Errorf("%s: sensors[%d].description is required", path, i)
 		}
 	}
+	if cfg.CommandStatusSensor != nil {
+		if cfg.CommandStatusSensor.Name == "" {
+			return nil, nil, fmt.Errorf("%s: command_status_sensor.name is required", path)
+		}
+		if seenSensors[cfg.CommandStatusSensor.Name] {
+			return nil, nil, fmt.Errorf("%s: command_status_sensor.name %q is also listed in sensors[]; declare it in only one place", path, cfg.CommandStatusSensor.Name)
+		}
+	}
 
 	deps := []string{cfg.AudioInName, cfg.TextToSpeechName}
 	resources := make([]string, 0, len(resourceSet))
@@ -194,9 +222,12 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	// Sensors are registered under the rdk:component:sensor API, so they
 	// need the full-resource-name form (otherwise the Viam dep resolver
 	// would look up a generic service by that name and fail).
-	sensorNames := make([]string, 0, len(cfg.Sensors))
+	sensorNames := make([]string, 0, len(cfg.Sensors)+1)
 	for _, se := range cfg.Sensors {
 		sensorNames = append(sensorNames, sensor.Named(se.Name).String())
+	}
+	if cfg.CommandStatusSensor != nil {
+		sensorNames = append(sensorNames, sensor.Named(cfg.CommandStatusSensor.Name).String())
 	}
 	sort.Strings(sensorNames)
 	deps = append(deps, sensorNames...)
@@ -220,6 +251,12 @@ type service struct {
 	// sensors retains config order so readings in the prompt list in a
 	// stable order (helps Claude's caching of the sensor section).
 	sensors []sensorRef
+
+	// commandStatusSensor is the optional designated "command status"
+	// sensor — its readings are injected into Claude's context under a
+	// distinct heading so Claude can reason about command progress.
+	// nil if not configured.
+	commandStatusSensor *sensorRef
 
 	wakeWord       string
 	wakeCooldown   time.Duration
@@ -298,6 +335,18 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 			handle:      handle,
 		})
 	}
+	var commandStatusSensor *sensorRef
+	if conf.CommandStatusSensor != nil {
+		handle, err := sensor.FromProvider(deps, conf.CommandStatusSensor.Name)
+		if err != nil {
+			return nil, fmt.Errorf("command_status_sensor %q not found: %w", conf.CommandStatusSensor.Name, err)
+		}
+		commandStatusSensor = &sensorRef{
+			name:        conf.CommandStatusSensor.Name,
+			description: conf.CommandStatusSensor.Description,
+			handle:      handle,
+		}
+	}
 
 	credBytes, err := json.Marshal(conf.GoogleCredJSON)
 	if err != nil {
@@ -362,7 +411,8 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		tts:             tts,
 		commands:        commands,
 		resources:       resources,
-		sensors:         sensors,
+		sensors:             sensors,
+		commandStatusSensor: commandStatusSensor,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		listenTimeout:    listenTimeout,
@@ -397,7 +447,8 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("{\n")
 	b.WriteString("  \"response\": \"<a short friendly sentence to say to the user>\",\n")
 	b.WriteString("  \"command\": \"<name from the list, or null>\",\n")
-	b.WriteString("  \"continue_conversation\": <true or false>\n")
+	b.WriteString("  \"continue_conversation\": <true or false>,\n")
+	b.WriteString("  \"command_in_progress\": <true or false>\n")
 	b.WriteString("}\n\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Always produce a non-empty \"response\". Every turn gets a spoken reply — confirmations, acknowledgments, thank-yous, farewells, or even a good-natured \"sorry, didn't catch that\" for vague input. Never return an empty string.\n")
@@ -406,7 +457,8 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
 	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.\n")
-	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.")
+	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.\n")
+	b.WriteString("- \"command_in_progress\" is a hard signal to voice-command about whether your most recently dispatched command is still running. Set it to true whenever a \"Current command status\" section is present and its readings show activity (queued, brewing, processing, pending, etc.). Set it to false when no status section is present, or when the status clearly indicates the command is finished, cancelled, or no command is active. While command_in_progress is true, voice-command will KEEP THE CONVERSATION OPEN regardless of continue_conversation, so the user can keep talking to you while the command runs. When the status shows the command has completed, set command_in_progress to false on the next turn so the conversation can end normally once the user's done.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -565,6 +617,7 @@ func (s *service) run() {
 		s.logger.Infow("llm decision",
 			"command", reply.Command,
 			"continue_conversation", reply.ContinueConversation,
+			"command_in_progress", reply.CommandInProgress,
 			"response", reply.Response)
 
 		if reply.Response != "" {
@@ -575,7 +628,13 @@ func (s *service) run() {
 				s.logger.Errorw("dispatch failed", "err", err, "command", reply.Command)
 			}
 		}
-		if reply.ContinueConversation {
+		// command_in_progress hard-overrides continue_conversation so a
+		// long-running command can't be prematurely ended mid-execution.
+		keepOpen := reply.ContinueConversation || reply.CommandInProgress
+		if keepOpen {
+			if reply.CommandInProgress && !reply.ContinueConversation {
+				s.logger.Infow("command_in_progress=true overriding continue_conversation=false")
+			}
 			s.extendConversation(newHistory)
 		} else {
 			// Play the wake-word reminder on every end-of-turn that
@@ -628,6 +687,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 	s.logger.Infow("lull decision",
 		"command", reply.Command,
 		"continue_conversation", reply.ContinueConversation,
+		"command_in_progress", reply.CommandInProgress,
 		"response", reply.Response,
 		"lull_count", count,
 		"min_lull_prompts", s.minLullPrompts)
@@ -639,6 +699,17 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
 			s.logger.Errorw("dispatch failed during lull", "err", err, "command", reply.Command)
 		}
+	}
+
+	// command_in_progress hard-overrides the end decision — if a command
+	// is still running, keep the conversation alive even if Claude wants
+	// to end and we've blown through the lull budget.
+	if reply.CommandInProgress {
+		if !reply.ContinueConversation || count >= s.minLullPrompts {
+			s.logger.Infow("command_in_progress=true overriding end-of-conversation during lull")
+		}
+		s.extendConversation(newHistory)
+		return
 	}
 
 	// Honor Claude's desire to end only once we've met the minimum budget.
@@ -899,39 +970,56 @@ func stateName(s state) string {
 	return "unknown"
 }
 
-// interpretedReply is what the LLM is asked to return. Command is the Name
-// of a configured CommandEntry, or empty / null for "no action."
+// interpretedReply is what the LLM is asked to return. Command is the
+// Name of a configured CommandEntry, or empty / null for "no action."
+// CommandInProgress is an explicit flag Claude sets when the Current
+// command status block indicates the most recently dispatched command
+// is still running; voice-command hard-overrides continue_conversation
+// while this is true so the customer can keep talking during long
+// operations like a brew.
 type interpretedReply struct {
 	Response             string `json:"response"`
 	Command              string `json:"command"`
 	ContinueConversation bool   `json:"continue_conversation"`
+	CommandInProgress    bool   `json:"command_in_progress,omitempty"`
 }
 
 // fetchSensorReadings concurrently invokes Readings() on every configured
-// sensor and returns a map keyed by sensor name. A failure on any one
-// sensor is captured as {"error": "..."} under that sensor's slot so the
-// overall LLM call can still proceed with partial data.
+// sensor (both the ambient-context sensors[] list and the optional
+// command_status sensor) and returns a map keyed by sensor name. A
+// failure on any one sensor is captured as {"error": "..."} under that
+// sensor's slot so the overall LLM call can still proceed with partial
+// data.
 func (s *service) fetchSensorReadings(ctx context.Context) map[string]interface{} {
-	if len(s.sensors) == 0 {
+	total := len(s.sensors)
+	if s.commandStatusSensor != nil {
+		total++
+	}
+	if total == 0 {
 		return nil
 	}
-	out := make(map[string]interface{}, len(s.sensors))
+	out := make(map[string]interface{}, total)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	fetch := func(sr sensorRef) {
+		defer wg.Done()
+		readings, err := sr.handle.Readings(ctx, nil)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			s.logger.Warnw("sensor readings failed", "sensor", sr.name, "err", err)
+			out[sr.name] = map[string]interface{}{"error": err.Error()}
+			return
+		}
+		out[sr.name] = readings
+	}
 	for _, sr := range s.sensors {
 		wg.Add(1)
-		go func(sr sensorRef) {
-			defer wg.Done()
-			readings, err := sr.handle.Readings(ctx, nil)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				s.logger.Warnw("sensor readings failed", "sensor", sr.name, "err", err)
-				out[sr.name] = map[string]interface{}{"error": err.Error()}
-				return
-			}
-			out[sr.name] = readings
-		}(sr)
+		go fetch(sr)
+	}
+	if s.commandStatusSensor != nil {
+		wg.Add(1)
+		go fetch(*s.commandStatusSensor)
 	}
 	wg.Wait()
 	return out
@@ -939,17 +1027,41 @@ func (s *service) fetchSensorReadings(ctx context.Context) map[string]interface{
 
 // sensorContextBlock formats a fresh sensor-readings snapshot as the text
 // of the second (uncached) system block. Called once per interpret() turn.
+// Ambient sensors[] readings are listed first, followed by the designated
+// command-status readings under their own heading so Claude sees the
+// latter's role distinctly.
 func (s *service) sensorContextBlock(ctx context.Context) string {
 	readings := s.fetchSensorReadings(ctx)
 	var b strings.Builder
-	fmt.Fprintf(&b, "Current sensor readings (as of %s):\n", time.Now().UTC().Format(time.RFC3339))
-	for _, sr := range s.sensors {
-		payload, err := json.Marshal(readings[sr.name])
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if len(s.sensors) > 0 {
+		fmt.Fprintf(&b, "Current sensor readings (as of %s):\n", now)
+		for _, sr := range s.sensors {
+			payload, err := json.Marshal(readings[sr.name])
+			if err != nil {
+				payload = []byte(fmt.Sprintf("%q", err.Error()))
+			}
+			fmt.Fprintf(&b, "- %q (%s): %s\n", sr.name, sr.description, payload)
+		}
+	}
+
+	if s.commandStatusSensor != nil {
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		payload, err := json.Marshal(readings[s.commandStatusSensor.name])
 		if err != nil {
 			payload = []byte(fmt.Sprintf("%q", err.Error()))
 		}
-		fmt.Fprintf(&b, "- %q (%s): %s\n", sr.name, sr.description, payload)
+		desc := s.commandStatusSensor.description
+		if desc == "" {
+			desc = "state of the most recently dispatched command"
+		}
+		fmt.Fprintf(&b, "Current command status (as of %s, from %q — %s):\n%s",
+			now, s.commandStatusSensor.name, desc, payload)
 	}
+
 	return strings.TrimRight(b.String(), "\n")
 }
 
@@ -963,14 +1075,14 @@ func (s *service) interpret(ctx context.Context, utterance string, history []ant
 	msgs := append(append([]anthropic.MessageParam{}, history...), userMsg)
 
 	// First block: the stable, cached instructions + command list.
-	// Second block (if any sensors configured): fresh-per-turn readings,
-	// uncached, so it can change between calls without invalidating the
-	// cache on the first block.
+	// Second block (if any sensors or a command-status sensor are
+	// configured): fresh-per-turn readings, uncached, so it can change
+	// between calls without invalidating the cache on the first block.
 	systemBlocks := []anthropic.TextBlockParam{{
 		Text:         s.systemPrompt,
 		CacheControl: anthropic.NewCacheControlEphemeralParam(),
 	}}
-	if len(s.sensors) > 0 {
+	if len(s.sensors) > 0 || s.commandStatusSensor != nil {
 		systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
 			Text: s.sensorContextBlock(ctx),
 		})
