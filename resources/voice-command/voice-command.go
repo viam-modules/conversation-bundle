@@ -35,6 +35,12 @@ import (
 
 var Model = resource.NewModel("viam", "conversation-bundle", "voice-command")
 
+// errSilence signals that listenForCommand hit its silence timeout with
+// no speech captured. run() uses this to route to handleLull (in
+// conversation mode with a command still in progress) or to simply loop
+// (in wake mode, or in conversation mode once the command has completed).
+var errSilence = errors.New("voice-command: silence timeout")
+
 func init() {
 	resource.RegisterService(generic.API, Model,
 		resource.Registration[resource.Resource, *Config]{
@@ -310,6 +316,12 @@ type service struct {
 	// the current conversation. Resets on a real user utterance and on
 	// endConversation. Used to enforce MinLullPrompts.
 	lullCount int
+	// lastCmdInProgress mirrors the CommandInProgress flag from the most
+	// recent Claude reply in the current conversation. When false,
+	// silence in conversation mode ends the conversation cleanly instead
+	// of triggering a nudge — nudges only keep the user engaged while
+	// something is actually running.
+	lastCmdInProgress bool
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -547,24 +559,25 @@ func (s *service) Close(ctx context.Context) error {
 // inConversation reports whether a conversation window is currently open.
 // Returns the history to thread into the next LLM call and the deadline by
 // which the next utterance must arrive. When not in a conversation, history
-// is nil and deadline is the zero time.
-func (s *service) inConversation() (history []anthropic.MessageParam, deadline time.Time) {
+// is nil and cmdInProgress is false.
+func (s *service) inConversation() (history []anthropic.MessageParam, cmdInProgress bool, active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.convoExpiresAt.IsZero() || time.Now().After(s.convoExpiresAt) {
-		return nil, time.Time{}
+		return nil, false, false
 	}
 	// Return a copy so callers don't see concurrent appends.
 	h := make([]anthropic.MessageParam, len(s.convoHistory))
 	copy(h, s.convoHistory)
-	return h, s.convoExpiresAt
+	return h, s.lastCmdInProgress, true
 }
 
-func (s *service) extendConversation(history []anthropic.MessageParam) {
+func (s *service) extendConversation(history []anthropic.MessageParam, cmdInProgress bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.convoExpiresAt = time.Now().Add(s.listenTimeout)
 	s.convoHistory = history
+	s.lastCmdInProgress = cmdInProgress
 }
 
 func (s *service) endConversation() {
@@ -573,6 +586,7 @@ func (s *service) endConversation() {
 	s.convoExpiresAt = time.Time{}
 	s.convoHistory = nil
 	s.lullCount = 0
+	s.lastCmdInProgress = false
 }
 
 // resetLullCount marks that the user has engaged (real utterance), so the
@@ -599,30 +613,28 @@ func (s *service) bumpLullCount() int {
 func (s *service) run() {
 	defer s.workerWG.Done()
 	for s.workerCtx.Err() == nil {
-		history, deadline := s.inConversation()
-		inConvo := !deadline.IsZero()
+		history, cmdInProgress, inConvo := s.inConversation()
 
-		listenCtx := s.workerCtx
-		var cancel context.CancelFunc
-		if inConvo {
-			listenCtx, cancel = context.WithDeadline(s.workerCtx, deadline)
-		}
-		utterance, err := s.listenForCommand(listenCtx, inConvo)
-		if cancel != nil {
-			cancel()
-		}
+		utterance, err := s.listenForCommand(s.workerCtx, inConvo)
 
 		if err != nil {
 			if s.workerCtx.Err() != nil {
 				return
 			}
-			// In conversation mode, a deadline-exceeded means the user went
-			// silent. Instead of ending the conversation outright, ask
-			// Claude to generate a nudge prompt and keep the window open.
-			// If Claude judges the user has disengaged AND we've hit the
-			// configured minimum number of nudges, we honor that and end.
-			if inConvo && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded")) {
-				s.handleLull(history)
+			// Silence timeout: in conversation mode, route to the nudge
+			// flow only if a command is still running. Otherwise the
+			// conversation has nothing left to carry and we close it
+			// cleanly rather than chatter over the user's next move.
+			if errors.Is(err, errSilence) {
+				if inConvo {
+					if cmdInProgress {
+						s.handleLull(history)
+					} else {
+						s.logger.Infow("conversation silent and no command in progress; ending")
+						s.speakEndCue(s.workerCtx)
+						s.endConversation()
+					}
+				}
 				continue
 			}
 			// Google STT caps streaming sessions at 305s. The outer loop
@@ -676,7 +688,7 @@ func (s *service) run() {
 			if reply.CommandInProgress && !reply.ContinueConversation {
 				s.logger.Infow("command_in_progress=true overriding continue_conversation=false")
 			}
-			s.extendConversation(newHistory)
+			s.extendConversation(newHistory, reply.CommandInProgress)
 		} else {
 			// Play the wake-word reminder on every end-of-turn that
 			// doesn't continue the conversation — covers both the
@@ -714,7 +726,12 @@ const silenceMarker = "(the user has gone silent)"
 func (s *service) handleLull(history []anthropic.MessageParam) {
 	s.logger.Infow("conversation lull detected; generating nudge")
 
-	reply, newHistory, err := s.interpret(s.workerCtx, silenceMarker, history)
+	// Drop newHistory: the synthetic silence-marker turn and Claude's
+	// nudge response shouldn't be persisted into convoHistory. If they
+	// were, when the user finally speaks their real follow-up, Claude
+	// would see it as a reply to its own nudge instead of to the last
+	// real exchange, which sometimes makes it loop or re-greet.
+	reply, _, err := s.interpret(s.workerCtx, silenceMarker, history)
 	if err != nil {
 		// LLM roundtrip failed — fall back to the old behavior (end cue,
 		// close conversation) rather than spinning on errors.
@@ -749,7 +766,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		if !reply.ContinueConversation || count >= s.minLullPrompts {
 			s.logger.Infow("command_in_progress=true overriding end-of-conversation during lull")
 		}
-		s.extendConversation(newHistory)
+		s.extendConversation(history, true)
 		return
 	}
 
@@ -764,7 +781,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 	}
 	// Either Claude wants to keep going, or we're still under the minimum.
 	// Either way, extend the window and loop back to listening.
-	s.extendConversation(newHistory)
+	s.extendConversation(history, false)
 }
 
 // listenForCommand opens a Google STT streaming session, pipes mic audio
@@ -871,8 +888,10 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	// Recv error path below distinguishes which one fired via the atomic
 	// flags for telemetry.
 	//
-	// listenTimer: once we're in stateListening, the user has
-	// listenTimeout of total silence before we give up.
+	// listenTimer: the silence timeout. Armed on entering stateListening,
+	// reset every time new content arrives — so it fires only after
+	// listenTimeout of *true* silence (not while the user is mid-sentence
+	// and Google hasn't finalized yet).
 	//
 	// stableTimer: once captured content stops changing, we wait
 	// stableEndpoint before committing — beats Google's ~1-2s internal
@@ -893,17 +912,24 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 			streamCancel()
 		})
 	}
-	// resetStableTimer (re)arms the stable-endpoint timer whenever the
-	// captured content changes. When content is unchanged across
-	// interims, the timer keeps counting down — that's how we detect
-	// "user stopped talking". Content comparison is byte-level so that
-	// Google's occasional backward revisions (e.g. "expression" →
-	// "espresso") also reset the timer.
-	resetStableTimer := func(content string) {
-		if s.stableEndpoint <= 0 || content == "" || content == lastStableContent {
+	// onContentChange is called for every interim transcript whose
+	// captured content differs from the previous one. It (re)arms the
+	// stable-endpoint timer (so stability eventually commits) and resets
+	// the silence timeout (so the user can keep talking past the
+	// listenTimeout window without being cut off). Byte-level comparison
+	// catches Google's backward revisions (e.g. "expression" →
+	// "espresso").
+	onContentChange := func(content string) {
+		if content == "" || content == lastStableContent {
 			return
 		}
 		lastStableContent = content
+		if listenTimer != nil {
+			listenTimer.Reset(s.listenTimeout)
+		}
+		if s.stableEndpoint <= 0 {
+			return
+		}
 		if stableTimer == nil {
 			stableTimer = time.AfterFunc(s.stableEndpoint, func() {
 				stableTimerFired.Store(true)
@@ -940,17 +966,26 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 			// treat it as a normal commit: return whatever we captured
 			// without an error.
 			if streamCtx.Err() != nil && ctx.Err() == nil {
+				captured := strings.TrimSpace(captureBuf.String())
+				// Pure silence: listenTimer fired and we never captured any
+				// speech. Signal the caller so it can route to handleLull
+				// (conversation mode) or just loop (wake mode).
+				if listenTimerFired.Load() && !stableTimerFired.Load() && captured == "" {
+					s.logger.Infow("listen timeout fired (silent)",
+						"state", stateName(state))
+					return "", errSilence
+				}
 				reason := "stream cancelled"
 				switch {
 				case stableTimerFired.Load():
 					reason = "committing utterance (stable endpoint)"
 				case listenTimerFired.Load():
-					reason = "listen timeout fired"
+					reason = "committing utterance (listen timeout)"
 				}
 				s.logger.Infow(reason,
 					"state", stateName(state),
-					"captured", captureBuf.String())
-				return strings.TrimSpace(captureBuf.String()), nil
+					"captured", captured)
+				return captured, nil
 			}
 			return "", fmt.Errorf("STT recv: %w", err)
 		}
@@ -995,7 +1030,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				if after != "" {
 					captureBuf.Reset()
 					captureBuf.WriteString(after)
-					resetStableTimer(after)
+					onContentChange(after)
 				}
 			case stateListening:
 				trimmed := strings.TrimSpace(transcript)
@@ -1019,7 +1054,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				if post != "" {
 					captureBuf.Reset()
 					captureBuf.WriteString(post)
-					resetStableTimer(post)
+					onContentChange(post)
 				}
 
 				// Cut early on word count: once we've heard at least
