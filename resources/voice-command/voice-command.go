@@ -73,14 +73,28 @@ type sensorRef struct {
 	handle      sensor.Sensor
 }
 
-// CommandStatusSensorConfig declares a single Viam sensor whose
-// Readings() describe the current state of whatever command
-// voice-command dispatched. Voice-command does not interpret the
-// readings itself — it just injects them into Claude's context under a
-// distinct heading so Claude can factor command progress into its
-// continue_conversation decision.
-type CommandStatusSensorConfig struct {
-	Name        string `json:"name"`
+// commandStatusRef is the runtime counterpart to CommandStatusConfig: a
+// resolved generic resource handle whose Status() method is fetched fresh
+// on every turn.
+type commandStatusRef struct {
+	name        string
+	description string
+	handle      resource.Resource
+}
+
+// CommandStatusConfig declares a single Viam resource whose Status() method
+// describes the current state of whatever command voice-command dispatched.
+// Voice-command does not interpret the status itself — it just injects it
+// into Claude's context under a distinct heading so Claude can factor
+// command progress into its continue_conversation decision.
+//
+// The resource must be resolvable as a generic service (API
+// rdk:service:generic). Status() is defined on every resource.Resource in
+// rdk v0.119.2+; the default embedded implementation returns an empty map,
+// so the source resource should implement its own Status() to be useful
+// here.
+type CommandStatusConfig struct {
+	Resource    string `json:"resource"`
 	Description string `json:"description,omitempty"`
 }
 
@@ -97,14 +111,14 @@ type Config struct {
 	// context reports the error so Claude can react appropriately.
 	Sensors []SensorEntry `json:"sensors,omitempty"`
 
-	// CommandStatusSensor is an optional designated sensor whose Readings()
-	// report the state of the last-dispatched command (e.g., whether it's
-	// still running, queue depth, result so far). Readings are included in
-	// Claude's context every turn under a separate heading so Claude can
-	// factor command progress into its continue_conversation decision —
-	// for example, keeping the conversation open while a brew is in
-	// progress. Voice-command does not interpret the readings itself.
-	CommandStatusSensor *CommandStatusSensorConfig `json:"command_status_sensor,omitempty"`
+	// CommandStatus is an optional designated resource whose Status() method
+	// reports the state of the last-dispatched command (e.g., whether it's
+	// still running, queue depth, result so far). The Status map is included
+	// in Claude's context every turn under a separate heading so Claude can
+	// factor command progress into its continue_conversation decision — for
+	// example, keeping the conversation open while a brew is in progress.
+	// Voice-command does not interpret the status itself.
+	CommandStatus *CommandStatusConfig `json:"command_status,omitempty"`
 
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
@@ -212,16 +226,18 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 			return nil, nil, fmt.Errorf("%s: sensors[%d].description is required", path, i)
 		}
 	}
-	if cfg.CommandStatusSensor != nil {
-		if cfg.CommandStatusSensor.Name == "" {
-			return nil, nil, fmt.Errorf("%s: command_status_sensor.name is required", path)
-		}
-		if seenSensors[cfg.CommandStatusSensor.Name] {
-			return nil, nil, fmt.Errorf("%s: command_status_sensor.name %q is also listed in sensors[]; declare it in only one place", path, cfg.CommandStatusSensor.Name)
+	if cfg.CommandStatus != nil {
+		if cfg.CommandStatus.Resource == "" {
+			return nil, nil, fmt.Errorf("%s: command_status.resource is required", path)
 		}
 	}
 
 	deps := []string{cfg.AudioInName, cfg.TextToSpeechName}
+	if cfg.CommandStatus != nil {
+		// Resolved under generic.API, same as commands[].resource — adding
+		// as a bare name defaults to that API in the dep resolver.
+		resourceSet[cfg.CommandStatus.Resource] = true
+	}
 	resources := make([]string, 0, len(resourceSet))
 	for r := range resourceSet {
 		resources = append(resources, r)
@@ -231,12 +247,9 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	// Sensors are registered under the rdk:component:sensor API, so they
 	// need the full-resource-name form (otherwise the Viam dep resolver
 	// would look up a generic service by that name and fail).
-	sensorNames := make([]string, 0, len(cfg.Sensors)+1)
+	sensorNames := make([]string, 0, len(cfg.Sensors))
 	for _, se := range cfg.Sensors {
 		sensorNames = append(sensorNames, sensor.Named(se.Name).String())
-	}
-	if cfg.CommandStatusSensor != nil {
-		sensorNames = append(sensorNames, sensor.Named(cfg.CommandStatusSensor.Name).String())
 	}
 	sort.Strings(sensorNames)
 	deps = append(deps, sensorNames...)
@@ -261,11 +274,11 @@ type service struct {
 	// stable order (helps Claude's caching of the sensor section).
 	sensors []sensorRef
 
-	// commandStatusSensor is the optional designated "command status"
-	// sensor — its readings are injected into Claude's context under a
-	// distinct heading so Claude can reason about command progress.
-	// nil if not configured.
-	commandStatusSensor *sensorRef
+	// commandStatus is the optional designated "command status" resource —
+	// its Status() output is injected into Claude's context under a distinct
+	// heading so Claude can reason about command progress. nil if not
+	// configured.
+	commandStatus *commandStatusRef
 
 	wakeWord       string
 	wakeCooldown   time.Duration
@@ -345,15 +358,22 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 			handle:      handle,
 		})
 	}
-	var commandStatusSensor *sensorRef
-	if conf.CommandStatusSensor != nil {
-		handle, err := sensor.FromProvider(deps, conf.CommandStatusSensor.Name)
-		if err != nil {
-			return nil, fmt.Errorf("command_status_sensor %q not found: %w", conf.CommandStatusSensor.Name, err)
+	var commandStatus *commandStatusRef
+	if conf.CommandStatus != nil {
+		// Reuse the handle already resolved for commands[] if the same
+		// resource is configured as both a command target and the status
+		// source — common case, since the coffee service is typically both.
+		handle, ok := resources[conf.CommandStatus.Resource]
+		if !ok {
+			h, err := deps.Lookup(generic.Named(conf.CommandStatus.Resource))
+			if err != nil {
+				return nil, fmt.Errorf("command_status resource %q not found: %w", conf.CommandStatus.Resource, err)
+			}
+			handle = h
 		}
-		commandStatusSensor = &sensorRef{
-			name:        conf.CommandStatusSensor.Name,
-			description: conf.CommandStatusSensor.Description,
+		commandStatus = &commandStatusRef{
+			name:        conf.CommandStatus.Resource,
+			description: conf.CommandStatus.Description,
 			handle:      handle,
 		}
 	}
@@ -432,7 +452,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		commands:        commands,
 		resources:       resources,
 		sensors:             sensors,
-		commandStatusSensor: commandStatusSensor,
+		commandStatus:       commandStatus,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		listenTimeout:    listenTimeout,
@@ -1054,61 +1074,65 @@ type interpretedReply struct {
 	CommandInProgress    bool   `json:"command_in_progress,omitempty"`
 }
 
-// fetchSensorReadings concurrently invokes Readings() on every configured
-// sensor (both the ambient-context sensors[] list and the optional
-// command_status sensor) and returns a map keyed by sensor name. A
-// failure on any one sensor is captured as {"error": "..."} under that
-// sensor's slot so the overall LLM call can still proceed with partial
-// data.
-func (s *service) fetchSensorReadings(ctx context.Context) map[string]interface{} {
-	total := len(s.sensors)
-	if s.commandStatusSensor != nil {
-		total++
+// fetchContext concurrently gathers sensor Readings() for the ambient
+// sensors[] list and Status() for the optional command-status resource.
+// Failures are captured as {"error": "..."} under their slot so the LLM
+// call can still proceed with partial data.
+func (s *service) fetchContext(ctx context.Context) (sensorReadings map[string]interface{}, commandStatus map[string]interface{}) {
+	if len(s.sensors) == 0 && s.commandStatus == nil {
+		return nil, nil
 	}
-	if total == 0 {
-		return nil
-	}
-	out := make(map[string]interface{}, total)
+	sensorReadings = make(map[string]interface{}, len(s.sensors))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	fetch := func(sr sensorRef) {
-		defer wg.Done()
-		readings, err := sr.handle.Readings(ctx, nil)
-		mu.Lock()
-		defer mu.Unlock()
-		if err != nil {
-			s.logger.Warnw("sensor readings failed", "sensor", sr.name, "err", err)
-			out[sr.name] = map[string]interface{}{"error": err.Error()}
-			return
-		}
-		out[sr.name] = readings
-	}
 	for _, sr := range s.sensors {
 		wg.Add(1)
-		go fetch(sr)
+		go func(sr sensorRef) {
+			defer wg.Done()
+			readings, err := sr.handle.Readings(ctx, nil)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				s.logger.Warnw("sensor readings failed", "sensor", sr.name, "err", err)
+				sensorReadings[sr.name] = map[string]interface{}{"error": err.Error()}
+				return
+			}
+			sensorReadings[sr.name] = readings
+		}(sr)
 	}
-	if s.commandStatusSensor != nil {
+	if s.commandStatus != nil {
 		wg.Add(1)
-		go fetch(*s.commandStatusSensor)
+		go func() {
+			defer wg.Done()
+			status, err := s.commandStatus.handle.Status(ctx)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				s.logger.Warnw("command status fetch failed", "resource", s.commandStatus.name, "err", err)
+				commandStatus = map[string]interface{}{"error": err.Error()}
+				return
+			}
+			commandStatus = status
+		}()
 	}
 	wg.Wait()
-	return out
+	return sensorReadings, commandStatus
 }
 
-// sensorContextBlock formats a fresh sensor-readings snapshot as the text
-// of the second (uncached) system block. Called once per interpret() turn.
+// sensorContextBlock formats a fresh snapshot of context as the text of
+// the second (uncached) system block. Called once per interpret() turn.
 // Ambient sensors[] readings are listed first, followed by the designated
-// command-status readings under their own heading so Claude sees the
-// latter's role distinctly.
+// command-status resource's Status() under its own heading so Claude sees
+// the latter's role distinctly.
 func (s *service) sensorContextBlock(ctx context.Context) string {
-	readings := s.fetchSensorReadings(ctx)
+	sensorReadings, commandStatus := s.fetchContext(ctx)
 	var b strings.Builder
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	if len(s.sensors) > 0 {
 		fmt.Fprintf(&b, "Current sensor readings (as of %s):\n", now)
 		for _, sr := range s.sensors {
-			payload, err := json.Marshal(readings[sr.name])
+			payload, err := json.Marshal(sensorReadings[sr.name])
 			if err != nil {
 				payload = []byte(fmt.Sprintf("%q", err.Error()))
 			}
@@ -1116,20 +1140,20 @@ func (s *service) sensorContextBlock(ctx context.Context) string {
 		}
 	}
 
-	if s.commandStatusSensor != nil {
+	if s.commandStatus != nil {
 		if b.Len() > 0 {
 			b.WriteString("\n")
 		}
-		payload, err := json.Marshal(readings[s.commandStatusSensor.name])
+		payload, err := json.Marshal(commandStatus)
 		if err != nil {
 			payload = []byte(fmt.Sprintf("%q", err.Error()))
 		}
-		desc := s.commandStatusSensor.description
+		desc := s.commandStatus.description
 		if desc == "" {
 			desc = "state of the most recently dispatched command"
 		}
 		fmt.Fprintf(&b, "Current command status (as of %s, from %q — %s):\n%s",
-			now, s.commandStatusSensor.name, desc, payload)
+			now, s.commandStatus.name, desc, payload)
 	}
 
 	return strings.TrimRight(b.String(), "\n")
@@ -1152,7 +1176,7 @@ func (s *service) interpret(ctx context.Context, utterance string, history []ant
 		Text:         s.systemPrompt,
 		CacheControl: anthropic.NewCacheControlEphemeralParam(),
 	}}
-	if len(s.sensors) > 0 || s.commandStatusSensor != nil {
+	if len(s.sensors) > 0 || s.commandStatus != nil {
 		systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
 			Text: s.sensorContextBlock(ctx),
 		})
