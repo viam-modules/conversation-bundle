@@ -16,6 +16,12 @@
       "model": "viam:conversation-bundle:voice-command",
       "short_description": "Wake-word + STT + Claude + TTS orchestrator with configurable DoCommand targets.",
       "markdown_link": "README.md#model-viamconversation-bundlevoice-command"
+    },
+    {
+      "api": "rdk:component:sensor",
+      "model": "viam:conversation-bundle:weather-sensor",
+      "short_description": "Weather sensor for a configured lat/long, via the Open-Meteo free API.",
+      "markdown_link": "README.md#model-viamconversation-bundleweather-sensor"
     }
   ],
   "applications": null,
