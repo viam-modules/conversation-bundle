@@ -24,6 +24,7 @@ import (
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
 
 	"go.viam.com/rdk/components/audioin"
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	generic "go.viam.com/rdk/services/generic"
@@ -52,11 +53,37 @@ type CommandEntry struct {
 	DoCommand   map[string]interface{} `json:"do_command"`
 }
 
+// SensorEntry declares a Viam sensor resource whose Readings() are
+// fetched fresh on every LLM call and injected into the prompt as a
+// second, uncached system block — so Claude can reason about current
+// state (queue depth, environmental conditions, etc.). Description
+// helps Claude interpret the reading keys.
+type SensorEntry struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+// sensorRef is the runtime counterpart to SensorEntry: the resolved
+// sensor.Sensor handle bundled with the metadata needed to format its
+// readings into the prompt.
+type sensorRef struct {
+	name        string
+	description string
+	handle      sensor.Sensor
+}
+
 type Config struct {
 	AudioInName      string `json:"audio_in"`
 	TextToSpeechName string `json:"text_to_speech"`
 
 	Commands []CommandEntry `json:"commands"`
+
+	// Sensors lists Viam sensor resources whose Readings() are fetched
+	// fresh on every LLM call and attached to the request as additional
+	// context. Omit or leave empty for no sensor injection. Fetches run
+	// in parallel and fail soft — if a sensor errors, its slot in the
+	// context reports the error so Claude can react appropriately.
+	Sensors []SensorEntry `json:"sensors,omitempty"`
 
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
@@ -142,6 +169,21 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		resourceSet[c.Resource] = true
 	}
 
+	// Validate sensor entries and build their resource-name list.
+	seenSensors := map[string]bool{}
+	for i, se := range cfg.Sensors {
+		if se.Name == "" {
+			return nil, nil, fmt.Errorf("%s: sensors[%d].name is required", path, i)
+		}
+		if seenSensors[se.Name] {
+			return nil, nil, fmt.Errorf("%s: sensors[%d].name %q is not unique", path, i, se.Name)
+		}
+		seenSensors[se.Name] = true
+		if se.Description == "" {
+			return nil, nil, fmt.Errorf("%s: sensors[%d].description is required", path, i)
+		}
+	}
+
 	deps := []string{cfg.AudioInName, cfg.TextToSpeechName}
 	resources := make([]string, 0, len(resourceSet))
 	for r := range resourceSet {
@@ -149,6 +191,15 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	}
 	sort.Strings(resources)
 	deps = append(deps, resources...)
+	// Sensors are registered under the rdk:component:sensor API, so they
+	// need the full-resource-name form (otherwise the Viam dep resolver
+	// would look up a generic service by that name and fail).
+	sensorNames := make([]string, 0, len(cfg.Sensors))
+	for _, se := range cfg.Sensors {
+		sensorNames = append(sensorNames, sensor.Named(se.Name).String())
+	}
+	sort.Strings(sensorNames)
+	deps = append(deps, sensorNames...)
 	return deps, nil, nil
 }
 
@@ -165,6 +216,10 @@ type service struct {
 	// Resource name referenced from command entries.
 	commands  map[string]CommandEntry
 	resources map[string]resource.Resource
+
+	// sensors retains config order so readings in the prompt list in a
+	// stable order (helps Claude's caching of the sensor section).
+	sensors []sensorRef
 
 	wakeWord       string
 	wakeCooldown   time.Duration
@@ -227,6 +282,21 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 			return nil, fmt.Errorf("command %q: resource %q not found: %w", c.Name, c.Resource, err)
 		}
 		resources[c.Resource] = res
+	}
+
+	// Resolve each configured sensor. Preserved in config order so their
+	// readings always appear in a stable order in the prompt.
+	sensors := make([]sensorRef, 0, len(conf.Sensors))
+	for _, se := range conf.Sensors {
+		handle, err := sensor.FromDependencies(deps, se.Name)
+		if err != nil {
+			return nil, fmt.Errorf("sensor %q not found: %w", se.Name, err)
+		}
+		sensors = append(sensors, sensorRef{
+			name:        se.Name,
+			description: se.Description,
+			handle:      handle,
+		})
 	}
 
 	credBytes, err := json.Marshal(conf.GoogleCredJSON)
@@ -292,6 +362,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		tts:             tts,
 		commands:        commands,
 		resources:       resources,
+		sensors:         sensors,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		listenTimeout:    listenTimeout,
@@ -334,7 +405,8 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("- Set \"continue_conversation\" to true when you expect a follow-up — you asked a clarifying question or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., the requested action was confirmed or the user said goodbye). Err on the side of true if unsure, so the user can chime back in.\n")
 	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
-	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.")
+	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.\n")
+	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -835,6 +907,52 @@ type interpretedReply struct {
 	ContinueConversation bool   `json:"continue_conversation"`
 }
 
+// fetchSensorReadings concurrently invokes Readings() on every configured
+// sensor and returns a map keyed by sensor name. A failure on any one
+// sensor is captured as {"error": "..."} under that sensor's slot so the
+// overall LLM call can still proceed with partial data.
+func (s *service) fetchSensorReadings(ctx context.Context) map[string]interface{} {
+	if len(s.sensors) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(s.sensors))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, sr := range s.sensors {
+		wg.Add(1)
+		go func(sr sensorRef) {
+			defer wg.Done()
+			readings, err := sr.handle.Readings(ctx, nil)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				s.logger.Warnw("sensor readings failed", "sensor", sr.name, "err", err)
+				out[sr.name] = map[string]interface{}{"error": err.Error()}
+				return
+			}
+			out[sr.name] = readings
+		}(sr)
+	}
+	wg.Wait()
+	return out
+}
+
+// sensorContextBlock formats a fresh sensor-readings snapshot as the text
+// of the second (uncached) system block. Called once per interpret() turn.
+func (s *service) sensorContextBlock(ctx context.Context) string {
+	readings := s.fetchSensorReadings(ctx)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Current sensor readings (as of %s):\n", time.Now().UTC().Format(time.RFC3339))
+	for _, sr := range s.sensors {
+		payload, err := json.Marshal(readings[sr.name])
+		if err != nil {
+			payload = []byte(fmt.Sprintf("%q", err.Error()))
+		}
+		fmt.Fprintf(&b, "- %q (%s): %s\n", sr.name, sr.description, payload)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // interpret sends the utterance (with optional prior conversation history)
 // to Claude and returns the parsed reply plus the history extended with
 // this turn's user and assistant messages. Callers can thread the returned
@@ -844,14 +962,25 @@ func (s *service) interpret(ctx context.Context, utterance string, history []ant
 	userMsg := anthropic.NewUserMessage(anthropic.NewTextBlock(utterance))
 	msgs := append(append([]anthropic.MessageParam{}, history...), userMsg)
 
+	// First block: the stable, cached instructions + command list.
+	// Second block (if any sensors configured): fresh-per-turn readings,
+	// uncached, so it can change between calls without invalidating the
+	// cache on the first block.
+	systemBlocks := []anthropic.TextBlockParam{{
+		Text:         s.systemPrompt,
+		CacheControl: anthropic.NewCacheControlEphemeralParam(),
+	}}
+	if len(s.sensors) > 0 {
+		systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
+			Text: s.sensorContextBlock(ctx),
+		})
+	}
+
 	msg, err := s.anthropicClient.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     s.anthropicModel,
 		MaxTokens: s.maxTokens,
-		System: []anthropic.TextBlockParam{{
-			Text:         s.systemPrompt,
-			CacheControl: anthropic.NewCacheControlEphemeralParam(),
-		}},
-		Messages: msgs,
+		System:    systemBlocks,
+		Messages:  msgs,
 	})
 	if err != nil {
 		return interpretedReply{}, history, fmt.Errorf("anthropic messages: %w", err)
