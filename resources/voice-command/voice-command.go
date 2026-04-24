@@ -288,7 +288,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	// readings always appear in a stable order in the prompt.
 	sensors := make([]sensorRef, 0, len(conf.Sensors))
 	for _, se := range conf.Sensors {
-		handle, err := sensor.FromDependencies(deps, se.Name)
+		handle, err := sensor.FromProvider(deps, se.Name)
 		if err != nil {
 			return nil, fmt.Errorf("sensor %q not found: %w", se.Name, err)
 		}

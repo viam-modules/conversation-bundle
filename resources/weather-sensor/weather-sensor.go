@@ -157,7 +157,7 @@ func (s *weatherSensor) fetch(ctx context.Context) (map[string]interface{}, erro
 	if err != nil {
 		return nil, fmt.Errorf("open-meteo fetch: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
