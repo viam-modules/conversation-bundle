@@ -82,6 +82,14 @@ type Config struct {
 	// to an empty string to suppress the cue entirely.
 	ConversationEndCue *string `json:"conversation_end_cue,omitempty"`
 
+	// MinLullPrompts is the floor on how many Claude-generated nudge
+	// prompts voice-command will produce on consecutive silences before
+	// honoring Claude's continue_conversation=false signal and closing
+	// the conversation. If Claude sets continue_conversation=false on a
+	// nudge before this floor is reached, voice-command overrides and
+	// keeps the conversation open. Defaults to 2.
+	MinLullPrompts int `json:"min_lull_prompts,omitempty"`
+
 	GoogleCredJSON map[string]interface{} `json:"google_credentials_json"`
 	LanguageCode   string                 `json:"language_code,omitempty"`
 
@@ -163,6 +171,7 @@ type service struct {
 	listenTimeout   time.Duration
 	maxWords       int
 	endCue         string
+	minLullPrompts int
 	languageCode   string
 	systemPrompt   string
 	maxTokens      int64
@@ -182,6 +191,10 @@ type service struct {
 	// convoHistory to the LLM so follow-up utterances carry context.
 	convoExpiresAt time.Time
 	convoHistory   []anthropic.MessageParam
+	// lullCount tracks consecutive silence-triggered nudge prompts within
+	// the current conversation. Resets on a real user utterance and on
+	// endConversation. Used to enforce MinLullPrompts.
+	lullCount int
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -252,6 +265,10 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	} else {
 		endCue = *conf.ConversationEndCue
 	}
+	minLullPrompts := conf.MinLullPrompts
+	if minLullPrompts <= 0 {
+		minLullPrompts = 2
+	}
 	lang := conf.LanguageCode
 	if lang == "" {
 		lang = "en-US"
@@ -280,6 +297,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		listenTimeout:    listenTimeout,
 		maxWords:        maxWords,
 		endCue:          endCue,
+		minLullPrompts:  minLullPrompts,
 		languageCode:    lang,
 		systemPrompt:    systemPrompt,
 		maxTokens:       maxTokens,
@@ -315,7 +333,8 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null and still say something natural in \"response\".\n")
 	b.WriteString("- Set \"continue_conversation\" to true when you expect a follow-up — you asked a clarifying question or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., the requested action was confirmed or the user said goodbye). Err on the side of true if unsure, so the user can chime back in.\n")
 	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
-	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.")
+	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
+	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -388,6 +407,24 @@ func (s *service) endConversation() {
 	defer s.mu.Unlock()
 	s.convoExpiresAt = time.Time{}
 	s.convoHistory = nil
+	s.lullCount = 0
+}
+
+// resetLullCount marks that the user has engaged (real utterance), so the
+// next silence starts the nudge counter over.
+func (s *service) resetLullCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lullCount = 0
+}
+
+// bumpLullCount increments the consecutive-silence nudge counter and
+// returns the new value.
+func (s *service) bumpLullCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lullCount++
+	return s.lullCount
 }
 
 // run is the top-level listening loop. Each iteration opens a fresh STT
@@ -414,12 +451,13 @@ func (s *service) run() {
 			if s.workerCtx.Err() != nil {
 				return
 			}
-			// In conversation mode, a deadline-exceeded just means the window
-			// timed out without a follow-up. End the conversation cleanly.
+			// In conversation mode, a deadline-exceeded means the user went
+			// silent. Instead of ending the conversation outright, ask
+			// Claude to generate a nudge prompt and keep the window open.
+			// If Claude judges the user has disengaged AND we've hit the
+			// configured minimum number of nudges, we honor that and end.
 			if inConvo && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded")) {
-				s.logger.Infow("conversation window timed out; returning to wake-word mode")
-				s.speakEndCue(s.workerCtx)
-				s.endConversation()
+				s.handleLull(history)
 				continue
 			}
 			// Google STT caps streaming sessions at 305s. The outer loop
@@ -440,6 +478,9 @@ func (s *service) run() {
 		if utterance == "" {
 			continue
 		}
+		// The user said something real — reset the consecutive-silence
+		// counter so future lulls start a fresh budget.
+		s.resetLullCount()
 		s.logger.Infow("captured utterance", "text", utterance, "in_conversation", inConvo)
 
 		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
@@ -484,6 +525,62 @@ func (s *service) speakEndCue(ctx context.Context) {
 		return
 	}
 	s.speak(ctx, s.endCue)
+}
+
+// silenceMarker is the synthetic user-role message voice-command injects
+// into the conversation history when it detects a lull. The system prompt
+// tells Claude to recognize this literal string and respond with a nudge
+// rather than treat it as the user's actual words.
+const silenceMarker = "(the user has gone silent)"
+
+// handleLull runs the lull-prompt flow: ask Claude for a nudge based on
+// current history, speak whatever it returns, dispatch any command it
+// emits, and decide whether to keep the conversation open. If Claude sets
+// continue_conversation=false and we've already produced at least
+// minLullPrompts nudges, we honor that and end; otherwise we override and
+// stay open for another round.
+func (s *service) handleLull(history []anthropic.MessageParam) {
+	s.logger.Infow("conversation lull detected; generating nudge")
+
+	reply, newHistory, err := s.interpret(s.workerCtx, silenceMarker, history)
+	if err != nil {
+		// LLM roundtrip failed — fall back to the old behavior (end cue,
+		// close conversation) rather than spinning on errors.
+		s.logger.Errorw("lull interpret failed; ending conversation", "err", err)
+		s.speakEndCue(s.workerCtx)
+		s.endConversation()
+		return
+	}
+
+	count := s.bumpLullCount()
+	s.logger.Infow("lull decision",
+		"command", reply.Command,
+		"continue_conversation", reply.ContinueConversation,
+		"response", reply.Response,
+		"lull_count", count,
+		"min_lull_prompts", s.minLullPrompts)
+
+	if reply.Response != "" {
+		s.speak(s.workerCtx, reply.Response)
+	}
+	if reply.Command != "" {
+		if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
+			s.logger.Errorw("dispatch failed during lull", "err", err, "command", reply.Command)
+		}
+	}
+
+	// Honor Claude's desire to end only once we've met the minimum budget.
+	// Until then, override and keep the conversation alive.
+	if !reply.ContinueConversation && count >= s.minLullPrompts {
+		s.logger.Infow("ending conversation after lull budget met",
+			"lull_count", count, "min_lull_prompts", s.minLullPrompts)
+		s.speakEndCue(s.workerCtx)
+		s.endConversation()
+		return
+	}
+	// Either Claude wants to keep going, or we're still under the minimum.
+	// Either way, extend the window and loop back to listening.
+	s.extendConversation(newHistory)
 }
 
 // listenForCommand opens a Google STT streaming session, pipes mic audio
