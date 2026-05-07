@@ -511,7 +511,7 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
 	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.\n")
 	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.\n")
-	b.WriteString("- \"command_in_progress\" is a hard signal to voice-command about whether your most recently dispatched command is still running. Set it to true whenever a \"Current command status\" section is present and its readings show activity (queued, brewing, processing, pending, etc.). Set it to false when no status section is present, or when the status clearly indicates the command is finished, cancelled, or no command is active. While command_in_progress is true, voice-command will KEEP THE CONVERSATION OPEN regardless of continue_conversation, so the user can keep talking to you while the command runs. When the status shows the command has completed, set command_in_progress to false on the next turn so the conversation can end normally once the user's done.")
+	b.WriteString("- \"command_in_progress\" tells voice-command whether your most recently dispatched command is still running. Set it to true whenever a \"Current command status\" section is present and its readings show activity (queued, brewing, processing, pending, etc.); set it to false when no status section is present, or when the status indicates the command is finished, cancelled, or no command is active. When true and the user goes silent, voice-command will produce one short check-in nudge before closing the conversation. Conversation lifecycle is otherwise governed by continue_conversation alone — command_in_progress does NOT keep the conversation open against the user's wishes.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -681,13 +681,10 @@ func (s *service) run() {
 				s.logger.Errorw("dispatch failed", "err", err, "command", reply.Command)
 			}
 		}
-		// command_in_progress hard-overrides continue_conversation so a
-		// long-running command can't be prematurely ended mid-execution.
-		keepOpen := reply.ContinueConversation || reply.CommandInProgress
-		if keepOpen {
-			if reply.CommandInProgress && !reply.ContinueConversation {
-				s.logger.Infow("command_in_progress=true overriding continue_conversation=false")
-			}
+		// continue_conversation alone gates conversation lifecycle;
+		// command_in_progress is threaded through to inform first-silence
+		// behavior but does not keep the conversation open on its own.
+		if reply.ContinueConversation {
 			s.extendConversation(newHistory, reply.CommandInProgress)
 		} else {
 			// Play the wake-word reminder on every end-of-turn that
@@ -757,17 +754,6 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
 			s.logger.Errorw("dispatch failed during lull", "err", err, "command", reply.Command)
 		}
-	}
-
-	// command_in_progress hard-overrides the end decision — if a command
-	// is still running, keep the conversation alive even if Claude wants
-	// to end and we've blown through the lull budget.
-	if reply.CommandInProgress {
-		if !reply.ContinueConversation || count >= s.minLullPrompts {
-			s.logger.Infow("command_in_progress=true overriding end-of-conversation during lull")
-		}
-		s.extendConversation(history, true)
-		return
 	}
 
 	// Honor Claude's desire to end only once we've met the minimum budget.
