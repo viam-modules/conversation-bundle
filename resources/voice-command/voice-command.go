@@ -52,12 +52,28 @@ func init() {
 // CommandEntry is one user-facing action voice-command can dispatch. The
 // LLM sees Name + Description and returns the Name of the entry it chose
 // (or nothing, to take no action); voice-command looks the entry up and
-// dispatches DoCommand verbatim to the named Resource.
+// dispatches DoCommand verbatim to the named Resource — optionally
+// deep-merged with an "arguments" object the LLM produced for this turn
+// (so runtime values like a customer's name can flow into the payload).
 type CommandEntry struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description"`
 	Resource    string                 `json:"resource"`
 	DoCommand   map[string]interface{} `json:"do_command"`
+	// ArgumentsHint is optional free-form text shown to Claude alongside
+	// Description, telling it what runtime values it may extract from the
+	// conversation and inject into this command's payload via the reply's
+	// "arguments" field. Example for an order command: "If the customer
+	// gave their name, set arguments.prepare_order.customer_name."
+	ArgumentsHint string `json:"arguments_hint,omitempty"`
+	// RequiredArguments lists dot-separated JSON paths into the merged
+	// payload that MUST be present and non-empty for the command to
+	// dispatch — e.g. "prepare_order.customer_name". Surfaced in the
+	// system prompt so Claude knows to gather them before issuing the
+	// command, and re-checked at dispatch time as a backstop: if any
+	// required path is missing, voice-command logs a warning and skips
+	// the dispatch (no partial order is sent).
+	RequiredArguments []string `json:"required_arguments,omitempty"`
 }
 
 // SensorEntry declares a Viam sensor resource whose Readings() are
@@ -494,14 +510,22 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("You are a voice-controlled assistant. A user just spoke to you. Pick at most one of the following commands to dispatch, and produce a short spoken reply.\n\n")
 	b.WriteString("Available commands:\n")
 	for _, c := range cmds {
-		fmt.Fprintf(&b, "- %q — %s\n", c.Name, c.Description)
+		fmt.Fprintf(&b, "- %q — %s", c.Name, c.Description)
+		if strings.TrimSpace(c.ArgumentsHint) != "" {
+			fmt.Fprintf(&b, " Arguments: %s", strings.TrimSpace(c.ArgumentsHint))
+		}
+		if len(c.RequiredArguments) > 0 {
+			fmt.Fprintf(&b, " REQUIRED arguments (must be populated before dispatch): %s.", strings.Join(c.RequiredArguments, ", "))
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("\nRespond with exactly one JSON object and nothing else. No prose before or after, no markdown code fences:\n\n")
 	b.WriteString("{\n")
 	b.WriteString("  \"response\": \"<a short friendly sentence to say to the user>\",\n")
 	b.WriteString("  \"command\": \"<name from the list, or null>\",\n")
 	b.WriteString("  \"continue_conversation\": <true or false>,\n")
-	b.WriteString("  \"command_in_progress\": <true or false>\n")
+	b.WriteString("  \"command_in_progress\": <true or false>,\n")
+	b.WriteString("  \"arguments\": <optional object of runtime values to inject into the chosen command's payload, or omit>\n")
 	b.WriteString("}\n\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Always produce a non-empty \"response\". Every turn gets a spoken reply — confirmations, acknowledgments, thank-yous, farewells, or even a good-natured \"sorry, didn't catch that\" for vague input. Never return an empty string.\n")
@@ -511,7 +535,10 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
 	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.\n")
 	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.\n")
-	b.WriteString("- \"command_in_progress\" tells voice-command whether your most recently dispatched command is still running. Set it to true whenever a \"Current command status\" section is present and its readings show activity (queued, brewing, processing, pending, etc.); set it to false when no status section is present, or when the status indicates the command is finished, cancelled, or no command is active. When true and the user goes silent, voice-command will produce one short check-in nudge before closing the conversation. Conversation lifecycle is otherwise governed by continue_conversation alone — command_in_progress does NOT keep the conversation open against the user's wishes.")
+	b.WriteString("- \"command_in_progress\" tells voice-command whether your most recently dispatched command is still running. Set it to true whenever a \"Current command status\" section is present and its readings show activity (queued, brewing, processing, pending, etc.); set it to false when no status section is present, or when the status indicates the command is finished, cancelled, or no command is active. When true and the user goes silent, voice-command will produce one short check-in nudge before closing the conversation. Conversation lifecycle is otherwise governed by continue_conversation alone — command_in_progress does NOT keep the conversation open against the user's wishes.\n")
+	b.WriteString("- \"arguments\" is an optional object that voice-command will deep-merge into the chosen command's preconfigured payload before dispatch. Use it to inject values you've gathered from the conversation — for example, the customer's name on an order. Match the JSON shape of the underlying do_command (e.g. set \"arguments\": { \"prepare_order\": { \"customer_name\": \"Alice\" } } to add a customer name to an order whose static payload is { \"prepare_order\": { \"drink\": \"espresso\" } }). Per-command \"Arguments:\" notes above tell you which fields each command accepts. Only populate values you have direct evidence for from the user's speech; never invent a name or other personal detail. Omit \"arguments\" entirely when there's nothing to inject.\n")
+	b.WriteString("- If a command lists \"REQUIRED arguments\" above, you MUST gather every one of those values from the user before dispatching. If even one required value is still unknown when the user asks for the command, do NOT set \"command\" to that name yet — instead, leave \"command\" as null, ask for the missing piece in your \"response\" (e.g. \"What's your name?\"), and set \"continue_conversation\" to true so the user can answer. Only on a later turn, once the required values are in hand, should you dispatch with \"arguments\" populated. Voice-command also re-validates: if a required path is missing in the dispatched payload, the call is silently dropped, so trying to skip the question won't work.\n")
+	b.WriteString("- The \"Current sensor readings\" and \"Current command status\" blocks in the latest system message are the SOURCE OF TRUTH about what is happening right now. Prior turns in this conversation may reference state that has since changed — if your earlier replies mentioned activity (a queued order, an in-progress brew, a pending task) that the current status block no longer reflects, treat that activity as finished and do not narrate it as if it's still happening. Only describe sensor or command state that's present in the *current* readings, never state you reported on an earlier turn.")
 	if strings.TrimSpace(userSuffix) != "" {
 		b.WriteString("\n\n")
 		b.WriteString(strings.TrimSpace(userSuffix))
@@ -677,7 +704,7 @@ func (s *service) run() {
 			s.speak(s.workerCtx, reply.Response)
 		}
 		if reply.Command != "" {
-			if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
+			if err := s.dispatch(s.workerCtx, reply.Command, reply.Arguments); err != nil {
 				s.logger.Errorw("dispatch failed", "err", err, "command", reply.Command)
 			}
 		}
@@ -751,7 +778,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		s.speak(s.workerCtx, reply.Response)
 	}
 	if reply.Command != "" {
-		if err := s.dispatch(s.workerCtx, reply.Command); err != nil {
+		if err := s.dispatch(s.workerCtx, reply.Command, reply.Arguments); err != nil {
 			s.logger.Errorw("dispatch failed during lull", "err", err, "command", reply.Command)
 		}
 	}
@@ -1089,10 +1116,16 @@ func stateName(s state) string {
 // while this is true so the customer can keep talking during long
 // operations like a brew.
 type interpretedReply struct {
-	Response             string `json:"response"`
-	Command              string `json:"command"`
-	ContinueConversation bool   `json:"continue_conversation"`
-	CommandInProgress    bool   `json:"command_in_progress,omitempty"`
+	Response             string                 `json:"response"`
+	Command              string                 `json:"command"`
+	ContinueConversation bool                   `json:"continue_conversation"`
+	CommandInProgress    bool                   `json:"command_in_progress,omitempty"`
+	// Arguments, if present, are deep-merged into the chosen command's
+	// preconfigured do_command before dispatch. Lets the LLM inject
+	// values it gathered from the conversation (e.g. a customer name)
+	// into specific fields the target resource accepts. Optional; an
+	// empty/missing object means "dispatch the static payload as-is."
+	Arguments map[string]interface{} `json:"arguments,omitempty"`
 }
 
 // fetchContext concurrently gathers sensor Readings() for the ambient
@@ -1133,6 +1166,7 @@ func (s *service) fetchContext(ctx context.Context) (sensorReadings map[string]i
 				commandStatus = map[string]interface{}{"error": err.Error()}
 				return
 			}
+			s.logger.Infow("command status received", "resource", s.commandStatus.name, "status", status)
 			commandStatus = status
 		}()
 	}
@@ -1252,8 +1286,10 @@ func (s *service) speak(ctx context.Context, text string) {
 // dispatch looks up the named CommandEntry and fires its DoCommand payload at
 // the pre-resolved target resource. Unknown command names are a soft error:
 // we log and return nil so a hallucinated name doesn't break the listening
-// loop.
-func (s *service) dispatch(ctx context.Context, commandName string) error {
+// loop. If arguments is non-empty, it is deep-merged into the static
+// payload before dispatch so the LLM can inject runtime values (e.g. a
+// customer name).
+func (s *service) dispatch(ctx context.Context, commandName string, arguments map[string]interface{}) error {
 	entry, ok := s.commands[commandName]
 	if !ok {
 		s.logger.Warnw("llm chose unknown command; skipping dispatch", "command", commandName)
@@ -1265,12 +1301,74 @@ func (s *service) dispatch(ctx context.Context, commandName string) error {
 		// Resource is in the map. Defensive log.
 		return fmt.Errorf("resource %q for command %q missing from resource map", entry.Resource, commandName)
 	}
+	payload := deepMergeMaps(entry.DoCommand, arguments)
+	for _, path := range entry.RequiredArguments {
+		if !pathPresent(payload, strings.Split(path, ".")) {
+			s.logger.Warnw("skipping dispatch: required argument missing",
+				"command", commandName,
+				"path", path,
+				"payload", payload)
+			return nil
+		}
+	}
 	s.logger.Infow("dispatching command",
 		"command", commandName,
 		"resource", entry.Resource,
-		"payload", entry.DoCommand)
-	_, err := target.DoCommand(ctx, entry.DoCommand)
+		"payload", payload,
+		"arguments", arguments)
+	_, err := target.DoCommand(ctx, payload)
 	return err
+}
+
+// pathPresent reports whether m has a non-empty value at the given dotted
+// path. Empty strings, nil, and missing keys all count as absent so that
+// declared required arguments aren't satisfied by placeholders.
+func pathPresent(m map[string]interface{}, parts []string) bool {
+	if len(parts) == 0 {
+		return false
+	}
+	v, ok := m[parts[0]]
+	if !ok || v == nil {
+		return false
+	}
+	if len(parts) == 1 {
+		if s, isStr := v.(string); isStr {
+			return strings.TrimSpace(s) != ""
+		}
+		return true
+	}
+	nested, ok := v.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	return pathPresent(nested, parts[1:])
+}
+
+// deepMergeMaps returns a new map containing base merged with overlay.
+// For keys present in both whose values are both maps, merging recurses;
+// otherwise overlay's value wins. base is treated as read-only — when
+// overlay is empty, base is returned unchanged so callers should not
+// mutate the result either.
+func deepMergeMaps(base, overlay map[string]interface{}) map[string]interface{} {
+	if len(overlay) == 0 {
+		return base
+	}
+	out := make(map[string]interface{}, len(base)+len(overlay))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range overlay {
+		if existing, ok := out[k]; ok {
+			if em, eok := existing.(map[string]interface{}); eok {
+				if vm, vok := v.(map[string]interface{}); vok {
+					out[k] = deepMergeMaps(em, vm)
+					continue
+				}
+			}
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // wordCount counts whitespace-separated tokens. Good enough for the
