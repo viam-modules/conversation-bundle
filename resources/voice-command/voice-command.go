@@ -1346,13 +1346,8 @@ func pathPresent(m map[string]interface{}, parts []string) bool {
 
 // deepMergeMaps returns a new map containing base merged with overlay.
 // For keys present in both whose values are both maps, merging recurses;
-// otherwise overlay's value wins. base is treated as read-only — when
-// overlay is empty, base is returned unchanged so callers should not
-// mutate the result either.
+// otherwise overlay's value wins.
 func deepMergeMaps(base, overlay map[string]interface{}) map[string]interface{} {
-	if len(overlay) == 0 {
-		return base
-	}
 	out := make(map[string]interface{}, len(base)+len(overlay))
 	for k, v := range base {
 		out[k] = v
