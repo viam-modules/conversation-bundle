@@ -304,7 +304,7 @@ type service struct {
 
 	wakeWord       string
 	wakeCooldown   time.Duration
-	listenTimeout   time.Duration
+	listenTimeout  time.Duration
 	maxWords       int
 	stableEndpoint time.Duration
 	endCue         string
@@ -479,11 +479,11 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		tts:             tts,
 		commands:        commands,
 		resources:       resources,
-		sensors:             sensors,
-		commandStatus:       commandStatus,
+		sensors:         sensors,
+		commandStatus:   commandStatus,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
-		listenTimeout:    listenTimeout,
+		listenTimeout:   listenTimeout,
 		maxWords:        maxWords,
 		stableEndpoint:  stableEndpoint,
 		endCue:          endCue,
@@ -525,13 +525,14 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 	b.WriteString("  \"command\": \"<name from the list, or null>\",\n")
 	b.WriteString("  \"continue_conversation\": <true or false>,\n")
 	b.WriteString("  \"command_in_progress\": <true or false>,\n")
+	b.WriteString("  \"addressed_to_me\": <true or false>,\n")
 	b.WriteString("  \"arguments\": <optional object of runtime values to inject into the chosen command's payload, or omit>\n")
 	b.WriteString("}\n\n")
 	b.WriteString("Rules:\n")
 	b.WriteString("- Always produce a non-empty \"response\". Every turn gets a spoken reply — confirmations, acknowledgments, thank-yous, farewells, or even a good-natured \"sorry, didn't catch that\" for vague input. Never return an empty string.\n")
 	b.WriteString("- If the utterance doesn't clearly match any command, set \"command\" to null and still say something natural in \"response\".\n")
 	b.WriteString("- Set \"continue_conversation\" to true when you expect a follow-up — you asked a clarifying question or the exchange invites more back-and-forth. Set false when the exchange is clearly complete (e.g., the requested action was confirmed or the user said goodbye). Err on the side of true if unsure, so the user can chime back in.\n")
-	b.WriteString("- If the utterance sounds like ambient conversation you weren't the intended recipient of, you can acknowledge it briefly (\"Sorry, were you talking to me?\" or similar) rather than going silent.\n")
+	b.WriteString("- Set \"addressed_to_me\" to true ONLY when the utterance is clearly engaging with you. True signals: a recognizable command or order; second-person address (\"can you...\", \"do you have...\"); a direct, on-topic answer to a question you just asked (e.g. you asked \"espresso, lungo, or decaf?\" and they said \"espresso\" or \"actually, make it a lungo\"); a clear greeting/farewell directed at the assistant. Set \"addressed_to_me\" to false for: sentence fragments and trailing-off speech (\"like\", \"I'm thinking about\", \"unrelated\", \"and then I went to...\"); third-person references (\"the robot is...\", \"it said...\"); narrative or storytelling shapes that aren't an order; side conversations between people in the room; background TV/music/podcast audio; off-topic chatter that doesn't connect to anything you asked. If you find yourself wanting to write a response like \"sorry, were you talking to me?\" or \"did you want to order something?\" — that is the signal to set \"addressed_to_me\" to false instead, NOT to write that response. When false, voice-command silently drops the turn (no speech, no dispatch, no history append), so the real user can keep talking without the assistant interrupting. Treat the synthetic \"(the user has gone silent)\" marker as addressed to you (it is a directive from voice-command itself).\n")
 	b.WriteString("- Prior turns in this conversation (if any) are included as chat history; treat them as context.\n")
 	b.WriteString("- If the most recent user message is the literal marker \"(the user has gone silent)\", it means voice-command detected a lull and is asking you to generate a nudge. Produce a brief, in-character check-in that keeps things moving (e.g. if an order or task is in progress, reassure or offer something small). Don't interpret the marker as the user's actual speech or quote it back. You may set \"continue_conversation\" to false once you judge the user has truly disengaged; voice-command may override early silences up to a configured minimum, then it will honor your decision.\n")
 	b.WriteString("- If a second system block titled \"Current sensor readings\" is present, use those values to inform your response when relevant (e.g. reference queue state before promising a wait time, factor in environment readings if asked). Don't quote raw JSON back at the user; translate the information into natural speech.\n")
@@ -682,9 +683,6 @@ func (s *service) run() {
 		if utterance == "" {
 			continue
 		}
-		// The user said something real — reset the consecutive-silence
-		// counter so future lulls start a fresh budget.
-		s.resetLullCount()
 		s.logger.Infow("captured utterance", "text", utterance, "in_conversation", inConvo)
 
 		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
@@ -694,10 +692,26 @@ func (s *service) run() {
 			s.endConversation()
 			continue
 		}
+		// In conversation mode, drop utterances Claude judges weren't
+		// addressed to us — the conversation timer keeps ticking, so a
+		// stale window populated only by chatter expires naturally. In
+		// wake mode the wake word already authorized this turn, so the
+		// gate doesn't apply.
+		if inConvo && !reply.AddressedToMe {
+			s.logger.Infow("dropped overheard utterance",
+				"text", utterance,
+				"suppressed_response", reply.Response,
+				"suppressed_command", reply.Command)
+			continue
+		}
+		// The user said something real — reset the consecutive-silence
+		// counter so future lulls start a fresh budget.
+		s.resetLullCount()
 		s.logger.Infow("llm decision",
 			"command", reply.Command,
 			"continue_conversation", reply.ContinueConversation,
 			"command_in_progress", reply.CommandInProgress,
+			"addressed_to_me", reply.AddressedToMe,
 			"response", reply.Response)
 
 		if reply.Response != "" {
@@ -1116,10 +1130,13 @@ func stateName(s state) string {
 // while this is true so the customer can keep talking during long
 // operations like a brew.
 type interpretedReply struct {
-	Response             string                 `json:"response"`
-	Command              string                 `json:"command"`
-	ContinueConversation bool                   `json:"continue_conversation"`
-	CommandInProgress    bool                   `json:"command_in_progress,omitempty"`
+	Response             string `json:"response"`
+	Command              string `json:"command"`
+	ContinueConversation bool   `json:"continue_conversation"`
+	CommandInProgress    bool   `json:"command_in_progress,omitempty"`
+	// AddressedToMe is the LLM's judgment of whether this utterance was
+	// actually directed at the assistant.
+	AddressedToMe bool `json:"addressed_to_me"`
 	// Arguments, if present, are deep-merged into the chosen command's
 	// preconfigured do_command before dispatch. Lets the LLM inject
 	// values it gathered from the conversation (e.g. a customer name)
