@@ -1,9 +1,12 @@
 module conversationbundle
 
-go 1.25.1
+go 1.26.0
 
 require (
+	cloud.google.com/go/speech v1.33.0
 	cloud.google.com/go/texttospeech v1.19.0
+	github.com/anthropics/anthropic-sdk-go v1.37.0
+	go.bug.st/serial v1.7.0
 	go.viam.com/rdk v0.122.0
 	google.golang.org/api v0.276.0
 )
@@ -17,7 +20,6 @@ require (
 	cloud.google.com/go/iam v1.5.3 // indirect
 	cloud.google.com/go/longrunning v0.9.0 // indirect
 	cloud.google.com/go/monitoring v1.24.3 // indirect
-	cloud.google.com/go/speech v1.33.0 // indirect
 	cloud.google.com/go/storage v1.56.0 // indirect
 	codeberg.org/go-fonts/liberation v0.5.0 // indirect
 	codeberg.org/go-latex/latex v0.1.0 // indirect
@@ -28,7 +30,6 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.53.0 // indirect
 	github.com/a8m/envsubst v1.4.2 // indirect
 	github.com/ajstarks/svgo v0.0.0-20211024235047-1546f124cd8b // indirect
-	github.com/anthropics/anthropic-sdk-go v1.37.0 // indirect
 	github.com/apache/arrow/go/arrow v0.0.0-20201229220542-30ce2eb5d4dc // indirect
 	github.com/aws/aws-sdk-go-v2 v1.36.3 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.10 // indirect
@@ -204,7 +205,7 @@ require (
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
