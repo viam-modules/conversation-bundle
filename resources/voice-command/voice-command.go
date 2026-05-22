@@ -319,6 +319,11 @@ type service struct {
 	// ledIndicator is the optional generic resource voice-command drives on
 	// listening/idle transitions. nil if not configured.
 	ledIndicator resource.Resource
+	// ledCh feeds the async LED dispatcher (ledLoop). signalLED enqueues
+	// payloads non-blocking with drop-on-full semantics so a slow or hung
+	// LED resource can never stall the conversation loop. nil if no LED
+	// indicator is configured.
+	ledCh chan map[string]interface{}
 
 	wakeWord       string
 	wakeCooldown   time.Duration
@@ -532,9 +537,19 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		speechClient:    speechClient,
 		anthropicClient: anthropicClient,
 	}
+	if ledIndicator != nil {
+		// Buffer size 4 is plenty: state transitions fire at human cadence
+		// (handful per turn), and drop-on-full is acceptable for a purely
+		// visual indicator.
+		s.ledCh = make(chan map[string]interface{}, 4)
+	}
 	s.workerCtx, s.workerCancel = context.WithCancel(context.Background())
 	s.workerWG.Add(1)
 	go s.run()
+	if s.ledCh != nil {
+		s.workerWG.Add(1)
+		go s.ledLoop()
+	}
 	return s, nil
 }
 
@@ -726,14 +741,14 @@ func (s *service) run() {
 		// dispatched command. Held until we know whether the conversation
 		// continues (then the next listenForCommand cycle replaces it with
 		// listening) or ends (then we explicitly clear to idle below).
-		s.signalLED(s.workerCtx, ledThinkingPayload)
+		s.signalLED(ledThinkingPayload)
 
 		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
 		if err != nil {
 			s.logger.Errorw("llm interpret failed", "err", err)
 			s.speak(s.workerCtx, "Sorry, I had trouble understanding that. Could you try again?")
 			s.endConversation()
-			s.signalLED(s.workerCtx, ledIdlePayload)
+			s.signalLED(ledIdlePayload)
 			continue
 		}
 		// In conversation mode, drop utterances Claude judges weren't
@@ -783,7 +798,7 @@ func (s *service) run() {
 			// robot is idle and waiting for the next wake word.
 			s.speakEndCue(s.workerCtx)
 			s.endConversation()
-			s.signalLED(s.workerCtx, ledIdlePayload)
+			s.signalLED(ledIdlePayload)
 		}
 	}
 }
@@ -815,7 +830,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 
 	// Lull-nudge runs an LLM call + TTS playback; surface that as
 	// "thinking" so the user sees activity instead of dead air.
-	s.signalLED(s.workerCtx, ledThinkingPayload)
+	s.signalLED(ledThinkingPayload)
 
 	// Drop newHistory: the synthetic silence-marker turn and Claude's
 	// nudge response shouldn't be persisted into convoHistory. If they
@@ -829,7 +844,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		s.logger.Errorw("lull interpret failed; ending conversation", "err", err)
 		s.speakEndCue(s.workerCtx)
 		s.endConversation()
-		s.signalLED(s.workerCtx, ledIdlePayload)
+		s.signalLED(ledIdlePayload)
 		return
 	}
 
@@ -858,7 +873,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 			"lull_count", count, "min_lull_prompts", s.minLullPrompts)
 		s.speakEndCue(s.workerCtx)
 		s.endConversation()
-		s.signalLED(s.workerCtx, ledIdlePayload)
+		s.signalLED(ledIdlePayload)
 		return
 	}
 	// Either Claude wants to keep going, or we're still under the minimum.
@@ -887,12 +902,43 @@ var ledThinkingPayload = map[string]interface{}{"state": "thinking"}
 // across the listen→capture→interpret boundary without flickering.
 var ledIdlePayload = map[string]interface{}{"state": "idle"}
 
-func (s *service) signalLED(ctx context.Context, payload map[string]interface{}) {
-	if s.ledIndicator == nil {
+// signalLED enqueues a state transition for the async LED dispatcher.
+// Non-blocking: if the dispatcher is behind (e.g. the LED resource is slow
+// or hung), the signal is dropped rather than stalling the caller. The LED
+// is a purely visual indicator — best-effort delivery is the right
+// tradeoff against ever blocking the conversation loop on it.
+func (s *service) signalLED(payload map[string]interface{}) {
+	if s.ledCh == nil {
 		return
 	}
-	if _, err := s.ledIndicator.DoCommand(ctx, payload); err != nil {
-		s.logger.Warnw("led indicator do_command failed", "err", err)
+	select {
+	case s.ledCh <- payload:
+	default:
+		s.logger.Debugw("led indicator dispatch queue full; dropping signal", "payload", payload)
+	}
+}
+
+// ledLoop is the async LED dispatcher. It serializes DoCommand calls to the
+// configured indicator with a per-call timeout, so a hung serial port or
+// network issue at the indicator can never stall the conversation loop.
+// Exits when workerCtx is cancelled.
+func (s *service) ledLoop() {
+	defer s.workerWG.Done()
+	for {
+		select {
+		case <-s.workerCtx.Done():
+			return
+		case payload := <-s.ledCh:
+			// Use a bounded background context: the worker's lifecycle is
+			// gated by workerCtx (checked in the outer select), but each
+			// individual DoCommand gets its own short deadline so one
+			// stuck call can't pin the dispatcher.
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			if _, err := s.ledIndicator.DoCommand(ctx, payload); err != nil {
+				s.logger.Warnw("led indicator do_command failed", "err", err)
+			}
+			cancel()
+		}
 	}
 }
 
@@ -995,7 +1041,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 		state = stateListening
 	}
 	if state == stateListening {
-		s.signalLED(ctx, ledListeningPayload)
+		s.signalLED(ledListeningPayload)
 	}
 	var captureBuf strings.Builder
 
@@ -1131,7 +1177,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				s.mu.Unlock()
 				s.logger.Infow("wake word detected", "transcript", transcript)
 				state = stateListening
-				s.signalLED(ctx, ledListeningPayload)
+				s.signalLED(ledListeningPayload)
 				armListenTimeout()
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
 				// Short-circuit if we've already got enough to work with:
