@@ -717,6 +717,12 @@ func (s *service) run() {
 						s.speakEndCue(s.workerCtx)
 						s.endConversation()
 					}
+				} else {
+					// Wake mode: the wake word fired listening, but no
+					// follow-up came before listenTimeout. Reset the LED to
+					// idle — otherwise it sits in listening forever until
+					// the next wake word or a conversation actually ends.
+					s.signalLED(ledIdlePayload)
 				}
 				continue
 			}
