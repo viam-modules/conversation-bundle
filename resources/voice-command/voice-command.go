@@ -874,9 +874,11 @@ var ledListeningPayload = map[string]interface{}{"state": "listening"}
 // speech" and "started responding" so the user sees continuous activity.
 var ledThinkingPayload = map[string]interface{}{"state": "thinking"}
 
-// ledIdlePayload is the DoCommand fired when voice-command stops actively
-// listening (utterance committed, silence timeout, or stream ended) and
-// when a conversation closes cleanly.
+// ledIdlePayload is the DoCommand fired when a turn ends without continuing
+// the conversation, or when an error path terminates the current turn.
+// listenForCommand itself does not signal idle on exit — run() and
+// handleLull own all idle transitions, so the LED can hold "thinking"
+// across the listen→capture→interpret boundary without flickering.
 var ledIdlePayload = map[string]interface{}{"state": "idle"}
 
 func (s *service) signalLED(ctx context.Context, payload map[string]interface{}) {
@@ -986,15 +988,8 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	if startInConversation {
 		state = stateListening
 	}
-	// firedListening tracks whether we ever signalled the LED into the
-	// listening state during this listen session. Used to gate the idle
-	// signal on exit so we don't spam the LED with idle commands on every
-	// STT stream cycle (e.g. Google's 305s reopens) while only waiting for
-	// a wake word.
-	var firedListening bool
 	if state == stateListening {
 		s.signalLED(ctx, ledListeningPayload)
-		firedListening = true
 	}
 	var captureBuf strings.Builder
 
@@ -1067,12 +1062,6 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 		pipeCancel()
 		_ = sttStream.CloseSend()
 		pipeWG.Wait()
-		if firedListening {
-			// Use a background context: the listen ctx may already be
-			// cancelled here (silence timeout, stable endpoint), and we
-			// still want the LED to settle back to idle.
-			s.signalLED(context.Background(), ledIdlePayload)
-		}
 	}()
 
 	for {
@@ -1136,10 +1125,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				s.mu.Unlock()
 				s.logger.Infow("wake word detected", "transcript", transcript)
 				state = stateListening
-				if !firedListening {
-					s.signalLED(ctx, ledListeningPayload)
-					firedListening = true
-				}
+				s.signalLED(ctx, ledListeningPayload)
 				armListenTimeout()
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
 				// Short-circuit if we've already got enough to work with:
