@@ -25,6 +25,7 @@ import (
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
 
 	"go.viam.com/rdk/components/audioin"
+	componentgeneric "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
@@ -144,10 +145,12 @@ type Config struct {
 
 	// LEDIndicator is an optional generic resource that voice-command will
 	// drive on state transitions to signal whether it's actively listening.
-	// Intended for an LED strip (e.g. vijayvuyyuru:multi-led:multi-led), but
-	// any rdk:component:generic resource that understands the hardcoded
-	// listening/idle DoCommand payloads will work. Omit to disable the
-	// indicator entirely.
+	// Either a rdk:component:generic (e.g. vijayvuyyuru:multi-led:multi-led)
+	// or a rdk:service:generic (e.g. this module's led-bridge) is accepted —
+	// resolved by trying the component API first, then falling back to the
+	// service API. The target must understand the hardcoded listening /
+	// thinking / idle DoCommand payloads. Omit to disable the indicator
+	// entirely.
 	LEDIndicator string `json:"led_indicator,omitempty"`
 
 	WakeWord        string  `json:"wake_word,omitempty"`
@@ -424,15 +427,18 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	var ledIndicator resource.Resource
 	if conf.LEDIndicator != "" {
 		// Reuse the handle resolved for commands[] if the LED is also a
-		// command target; otherwise look it up directly.
+		// command target; otherwise look it up directly. Try component
+		// API first (matches vijayvuyyuru:multi-led:multi-led and other
+		// off-the-shelf LED modules), then fall back to service API
+		// (matches this module's led-bridge).
 		if h, ok := resources[conf.LEDIndicator]; ok {
 			ledIndicator = h
-		} else {
-			h, err := deps.Lookup(generic.Named(conf.LEDIndicator))
-			if err != nil {
-				return nil, fmt.Errorf("led_indicator resource %q not found: %w", conf.LEDIndicator, err)
-			}
+		} else if h, err := deps.Lookup(componentgeneric.Named(conf.LEDIndicator)); err == nil {
 			ledIndicator = h
+		} else if h, err := deps.Lookup(generic.Named(conf.LEDIndicator)); err == nil {
+			ledIndicator = h
+		} else {
+			return nil, fmt.Errorf("led_indicator resource %q not found under rdk:component:generic or rdk:service:generic", conf.LEDIndicator)
 		}
 	}
 
