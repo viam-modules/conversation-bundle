@@ -185,6 +185,14 @@ type Config struct {
 	// to an empty string to suppress the cue entirely.
 	ConversationEndCue *string `json:"conversation_end_cue,omitempty"`
 
+	// WakeSilenceCue is spoken when the wake word fires but Google's STT
+	// closes the stream with no captured follow-up (typical when the user
+	// said the wake word and then nothing). Gives audible feedback that
+	// the wake word was heard but timed out, instead of silently dropping
+	// back to idle. Omit to use the default ("Sorry, I didn't catch
+	// that"); set to an empty string to suppress the cue entirely.
+	WakeSilenceCue *string `json:"wake_silence_cue,omitempty"`
+
 	// MinLullPrompts is the floor on how many Claude-generated nudge
 	// prompts voice-command will produce on consecutive silences before
 	// honoring Claude's continue_conversation=false signal and closing
@@ -331,6 +339,7 @@ type service struct {
 	maxWords       int
 	stableEndpoint time.Duration
 	endCue         string
+	wakeSilenceCue string
 	minLullPrompts int
 	languageCode   string
 	systemPrompt   string
@@ -493,6 +502,13 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	} else {
 		endCue = *conf.ConversationEndCue
 	}
+	// Same omit-vs-explicit-empty semantics for the wake-silence cue.
+	var wakeSilenceCue string
+	if conf.WakeSilenceCue == nil {
+		wakeSilenceCue = "Sorry, I didn't catch that."
+	} else {
+		wakeSilenceCue = *conf.WakeSilenceCue
+	}
 	minLullPrompts := conf.MinLullPrompts
 	if minLullPrompts <= 0 {
 		minLullPrompts = 2
@@ -529,6 +545,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		maxWords:        maxWords,
 		stableEndpoint:  stableEndpoint,
 		endCue:          endCue,
+		wakeSilenceCue:  wakeSilenceCue,
 		minLullPrompts:  minLullPrompts,
 		languageCode:    lang,
 		systemPrompt:    systemPrompt,
@@ -742,6 +759,21 @@ func (s *service) run() {
 			continue
 		}
 		if utterance == "" {
+			// listenForCommand returns empty when Google STT sent IsFinal
+			// with no captured content — meaning the wake word fired
+			// listening but the user said nothing parseable, and Google's
+			// own VAD ended the utterance before our listenTimeout did.
+			// In wake mode this leaves the LED stuck in listening unless
+			// we reset it here, and the user gets no audible feedback
+			// since no utterance reached the LLM. In conversation mode
+			// the next iteration will re-signal listening so we leave
+			// the LED alone and don't repeat the cue.
+			if !inConvo {
+				s.signalLED(ledIdlePayload)
+				if s.wakeSilenceCue != "" {
+					s.speak(s.workerCtx, s.wakeSilenceCue)
+				}
+			}
 			continue
 		}
 		s.logger.Infow("captured utterance", "text", utterance, "in_conversation", inConvo)
