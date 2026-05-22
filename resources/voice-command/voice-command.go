@@ -711,6 +711,9 @@ func (s *service) run() {
 						s.handleLull(history)
 					} else {
 						s.logger.Infow("conversation silent and no command in progress; ending")
+						// Signal idle before the (blocking) end cue so the
+						// LED transitions immediately while the audio plays.
+						s.signalLED(ledIdlePayload)
 						s.speakEndCue(s.workerCtx)
 						s.endConversation()
 					}
