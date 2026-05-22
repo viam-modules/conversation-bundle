@@ -746,9 +746,12 @@ func (s *service) run() {
 		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
 		if err != nil {
 			s.logger.Errorw("llm interpret failed", "err", err)
+			// Signal idle before speak: speak blocks for the full duration
+			// of TTS playback, and we want the LED to reflect the
+			// conversation ending while the apology audio plays.
+			s.signalLED(ledIdlePayload)
 			s.speak(s.workerCtx, "Sorry, I had trouble understanding that. Could you try again?")
 			s.endConversation()
-			s.signalLED(ledIdlePayload)
 			continue
 		}
 		// In conversation mode, drop utterances Claude judges weren't
@@ -791,6 +794,12 @@ func (s *service) run() {
 			// Leave LED in thinking; the next listenForCommand cycle
 			// will signal listening as it enters stateListening.
 		} else {
+			// Signal idle before the end cue: speak blocks until TTS
+			// playback finishes, so firing idle afterward would leave
+			// the LED in "thinking" for the full duration of the
+			// "moving along"-style audio. The LED reflecting "done"
+			// while the audio plays out is the intended UX.
+			s.signalLED(ledIdlePayload)
 			// Play the wake-word reminder on every end-of-turn that
 			// doesn't continue the conversation — covers both the
 			// "one-shot wake-triggered turn" and "conversation ending
@@ -798,7 +807,6 @@ func (s *service) run() {
 			// robot is idle and waiting for the next wake word.
 			s.speakEndCue(s.workerCtx)
 			s.endConversation()
-			s.signalLED(ledIdlePayload)
 		}
 	}
 }
@@ -842,9 +850,11 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		// LLM roundtrip failed — fall back to the old behavior (end cue,
 		// close conversation) rather than spinning on errors.
 		s.logger.Errorw("lull interpret failed; ending conversation", "err", err)
+		// Signal idle before the (blocking) end cue so the LED transitions
+		// immediately rather than after audio playback completes.
+		s.signalLED(ledIdlePayload)
 		s.speakEndCue(s.workerCtx)
 		s.endConversation()
-		s.signalLED(ledIdlePayload)
 		return
 	}
 
@@ -871,9 +881,11 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 	if !reply.ContinueConversation && count >= s.minLullPrompts {
 		s.logger.Infow("ending conversation after lull budget met",
 			"lull_count", count, "min_lull_prompts", s.minLullPrompts)
+		// Signal idle before the (blocking) end cue so the LED transitions
+		// immediately rather than after audio playback completes.
+		s.signalLED(ledIdlePayload)
 		s.speakEndCue(s.workerCtx)
 		s.endConversation()
-		s.signalLED(ledIdlePayload)
 		return
 	}
 	// Either Claude wants to keep going, or we're still under the minimum.
