@@ -338,11 +338,9 @@ type service struct {
 	// of triggering a nudge — nudges only keep the user engaged while
 	// something is actually running.
 	lastCmdInProgress bool
-	// activityState is the current point in the listen→think→speak
-	// lifecycle ("idle", "listening", "thinking", "responding"). Set at the
-	// transition points and surfaced via Status() so external consumers
-	// (e.g. an LED indicator) can pull it; voice-command never acts on it.
-	// Empty is reported as "idle".
+	// activityState is the current lifecycle state ("idle", "listening",
+	// "thinking", "responding"), surfaced via Status() for consumers like an
+	// LED indicator to pull. Empty reads as "idle".
 	activityState string
 }
 
@@ -570,9 +568,8 @@ func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	// structpb.NewStruct (RDK's GetStatus serializer) rejects []string for
-	// list values — they must be []interface{}, or the whole GetStatus call
-	// errors over the wire. Convert before returning.
+	// RDK's GetStatus serializer (structpb) rejects []string; list values must
+	// be []interface{} or the whole call errors over the wire.
 	commands := make([]interface{}, len(names))
 	for i, n := range names {
 		commands[i] = n
@@ -841,9 +838,7 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 // is true), and returns the captured utterance once Google marks it final
 // (or earlier if the word-count cap is hit).
 func (s *service) listenForCommand(ctx context.Context, startInConversation bool) (string, error) {
-	// In a conversation follow-up we're immediately capturing; in wake mode
-	// we're idle until the wake word fires (see the stateListening transition
-	// below).
+	// Follow-up: capturing immediately. Wake mode: idle until the wake word.
 	if startInConversation {
 		s.setActivity("listening")
 	} else {

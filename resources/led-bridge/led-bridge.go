@@ -1,15 +1,8 @@
-// Package ledbridge provides the viam:conversation-bundle:led-bridge model,
-// a generic resource that PULLS lifecycle state from another resource and
-// drives a USB-serial-attached LED indicator firmware to match. The firmware
-// is a separate ESP32 sketch flashed to the indicator hardware, not part of
-// this repo.
-//
-// The component it watches is named by `status_source` and is depended on,
-// so it is built first. led-bridge polls that source's Status() on an
-// interval, reads the "state" field, and writes the corresponding payload to
-// the firmware over serial whenever the state changes. The source (e.g.
-// voice-command) knows nothing about LEDs; all of the "what does this state
-// look like" opinion lives here, in actionForState.
+// Package ledbridge provides the viam:conversation-bundle:led-bridge model: a
+// generic resource that polls another resource's Status() "state" field and
+// drives a USB-serial LED indicator firmware to match. The source (named by
+// status_source, e.g. voice-command) knows nothing about LEDs; the firmware (a
+// separate ESP32 sketch) owns the visuals.
 package ledbridge
 
 import (
@@ -42,24 +35,18 @@ func init() {
 }
 
 type Config struct {
-	// SerialPort is the path to the USB-serial device the indicator firmware
-	// is reachable at. On Linux this typically looks like /dev/ttyUSB0 or
-	// /dev/ttyACM0; on macOS it's /dev/cu.usbserial-XXXX.
+	// SerialPort is the USB-serial device path (e.g. /dev/ttyUSB0, or
+	// /dev/cu.usbserial-XXXX on macOS).
 	SerialPort string `json:"serial_port"`
 
-	// StatusSource is the name of the resource to watch. led-bridge polls
-	// its Status() and reacts to the "state" field. Typically the
-	// voice-command service, but any generic resource whose Status() reports
-	// a "state" string works — point it at a different one for a different
-	// flow.
+	// StatusSource is the resource to watch; led-bridge reacts to the "state"
+	// field of its Status(). Any resource exposing a "state" string works.
 	StatusSource string `json:"status_source"`
 
-	// BaudRate is optional; defaults to 115200, matching the indicator
-	// firmware. Override only if you've modified the firmware.
+	// BaudRate is optional; defaults to 115200 to match the firmware.
 	BaudRate int `json:"baud_rate,omitempty"`
 
-	// PollIntervalMs is optional; defaults to 200ms. How often to read the
-	// source's Status() looking for a state change.
+	// PollIntervalMs is optional; how often to poll Status(). Defaults to 200ms.
 	PollIntervalMs int `json:"poll_interval_ms,omitempty"`
 }
 
@@ -70,21 +57,15 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.StatusSource == "" {
 		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "status_source")
 	}
-	// status_source is resolved under generic.API; a bare name defaults to
-	// that API in the dep resolver, and listing it here makes Viam build it
-	// before us and inject the handle into deps.
+	// Bare name resolves under generic.API; listing it as a dep makes Viam
+	// build status_source before us.
 	return []string{cfg.StatusSource}, nil, nil
 }
 
-// actionForState maps a source lifecycle state to the JSON payload written to
-// the LED firmware, and acts as an allow-list: the bool is false for states
-// we don't recognize, which the caller treats as "leave the LED as-is".
-//
-// By design the payload just forwards the state word ({"state": "<state>"});
-// the firmware owns the visuals (color, animation, brightness) and matches on
-// that word. This keeps led-bridge decoupled from the firmware — the strip can
-// be redesigned without touching this code. To make a state drive richer
-// behavior from the Go side instead, return a fuller payload here.
+// actionForState maps a lifecycle state to the firmware payload. It forwards
+// the state word so the firmware owns the visuals; it also allow-lists known
+// states (ok=false means "leave the LED as-is"). Return a fuller payload here
+// to drive richer behavior from Go instead.
 func actionForState(state string) (map[string]interface{}, bool) {
 	switch state {
 	case "idle", "listening", "thinking", "responding":
@@ -104,23 +85,19 @@ type bridge struct {
 	source resource.Resource
 	poll   time.Duration
 
-	// serialPort and baudRate are retained for Status reporting; the
-	// underlying serial.Port doesn't expose them back.
+	// serialPort and baudRate are kept for Status reporting.
 	serialPort string
 	baudRate   int
 
-	// writeMu serializes writes so the poll loop and any manual DoCommand
-	// don't interleave bytes on the wire.
+	// writeMu serializes serial writes so bytes don't interleave.
 	writeMu sync.Mutex
 
-	// mu guards lastState, the most recent state we acted on — used to write
-	// only on change and to answer Status().
+	// mu guards lastState (the state we last acted on; used to write on change).
 	mu        sync.Mutex
 	lastState string
 
-	// statsMu protects the diagnostic counters below. Kept separate from
-	// writeMu so a Status query never blocks behind a slow port.Write —
-	// operators need diagnostics most when the wire is misbehaving.
+	// statsMu guards the diagnostic counters. Separate from writeMu so a Status
+	// query never blocks behind a slow port.Write.
 	statsMu      sync.Mutex
 	messagesSent int64
 	bytesSent    int64
@@ -214,41 +191,37 @@ func (b *bridge) tick() {
 	payload, ok := actionForState(state)
 	if ok {
 		if err := b.write(payload); err != nil {
-			// Leave lastState unchanged so the next tick retries the write —
-			// a transient serial hiccup self-heals once the port recovers.
-			// write() records and logs the error.
+			// Don't commit lastState — retry on the next tick so a transient
+			// serial hiccup self-heals. write() logs the error.
 			return
 		}
 	} else {
-		b.logger.Debugw("no action mapped for state; leaving LED unchanged", "state", state)
+		b.logger.Debugw("no action mapped; leaving LED unchanged", "state", state)
 	}
 
-	// Commit the state only once we've handled it (written, or deliberately
-	// ignored) so we don't re-process the same value every tick.
+	// Commit only after handling, so we don't re-process the same state.
 	b.mu.Lock()
 	b.lastState = state
 	b.mu.Unlock()
 }
 
-// write marshals a payload to line-delimited JSON, sends it over serial, and
-// records the outcome in the diagnostic counters surfaced by Status().
+// write sends payload as line-delimited JSON over serial and records the
+// outcome in the diagnostic counters surfaced by Status().
 func (b *bridge) write(payload map[string]interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 	b.writeMu.Lock()
-	// Trailing newline is the firmware's line delimiter — without it the
-	// device buffers indefinitely waiting for end-of-line.
+	// Trailing newline is the firmware's line delimiter.
 	n, werr := b.port.Write(append(data, '\n'))
 	b.writeMu.Unlock()
 
 	b.statsMu.Lock()
 	if werr != nil {
 		msg := werr.Error()
-		// Dedupe the log: only warn when the error changes, so a persistently
-		// broken port (retried every tick) doesn't flood the logs. Status()
-		// still surfaces the sticky last_error/last_error_at for diagnosis.
+		// Warn only when the error changes, so a persistently broken port
+		// (retried every tick) doesn't flood the logs.
 		if msg != b.lastError {
 			b.logger.Warnw("led serial write failed", "err", msg)
 		}
@@ -267,10 +240,9 @@ func (b *bridge) write(payload map[string]interface{}) error {
 	return nil
 }
 
-// Status reports the last state we acted on plus serial-write health — which
-// port/baud we're on, how many messages/bytes have gone out, when the last
-// one was, and the last error if any. Lets an operator confirm from the
-// dashboard whether the LED is actually wired up and receiving data.
+// Status reports the last state acted on plus serial-write health (port, baud,
+// message/byte counts, last send, last error) so an operator can confirm the
+// LED is wired up and receiving data.
 func (b *bridge) Status(ctx context.Context) (map[string]interface{}, error) {
 	b.mu.Lock()
 	lastState := b.lastState
@@ -295,8 +267,8 @@ func (b *bridge) Status(ctx context.Context) (map[string]interface{}, error) {
 	return status, nil
 }
 
-// DoCommand allows manually pushing a raw payload to the firmware, mostly for
-// bench testing the strip independent of the source. Pass {"payload": {...}}.
+// DoCommand pushes a raw payload to the firmware for bench testing, independent
+// of the source. Pass {"payload": {...}}.
 func (b *bridge) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	raw, ok := cmd["payload"].(map[string]interface{})
 	if !ok {
