@@ -142,14 +142,6 @@ type Config struct {
 	// Voice-command does not interpret the status itself.
 	CommandStatus *CommandStatusConfig `json:"command_status,omitempty"`
 
-	// LEDIndicator is an optional generic resource that voice-command will
-	// drive on state transitions to signal whether it's actively listening.
-	// Intended for an LED strip (e.g. vijayvuyyuru:multi-led:multi-led), but
-	// any rdk:component:generic resource that understands the hardcoded
-	// listening/idle DoCommand payloads will work. Omit to disable the
-	// indicator entirely.
-	LEDIndicator string `json:"led_indicator,omitempty"`
-
 	WakeWord        string  `json:"wake_word,omitempty"`
 	WakeCooldownSec float64 `json:"wake_cooldown_sec,omitempty"`
 
@@ -268,9 +260,6 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		// as a bare name defaults to that API in the dep resolver.
 		resourceSet[cfg.CommandStatus.Resource] = true
 	}
-	if cfg.LEDIndicator != "" {
-		resourceSet[cfg.LEDIndicator] = true
-	}
 	resources := make([]string, 0, len(resourceSet))
 	for r := range resourceSet {
 		resources = append(resources, r)
@@ -313,10 +302,6 @@ type service struct {
 	// configured.
 	commandStatus *commandStatusRef
 
-	// ledIndicator is the optional generic resource voice-command drives on
-	// listening/idle transitions. nil if not configured.
-	ledIndicator resource.Resource
-
 	wakeWord       string
 	wakeCooldown   time.Duration
 	listenTimeout  time.Duration
@@ -353,6 +338,19 @@ type service struct {
 	// of triggering a nudge — nudges only keep the user engaged while
 	// something is actually running.
 	lastCmdInProgress bool
+	// activityState is the current point in the listen→think→speak
+	// lifecycle ("idle", "listening", "thinking", "responding"). Set at the
+	// transition points and surfaced via Status() so external consumers
+	// (e.g. an LED indicator) can pull it; voice-command never acts on it.
+	// Empty is reported as "idle".
+	activityState string
+}
+
+// setActivity records the current lifecycle state for Status() consumers.
+func (s *service) setActivity(state string) {
+	s.mu.Lock()
+	s.activityState = state
+	s.mu.Unlock()
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -418,21 +416,6 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 			name:        conf.CommandStatus.Resource,
 			description: conf.CommandStatus.Description,
 			handle:      handle,
-		}
-	}
-
-	var ledIndicator resource.Resource
-	if conf.LEDIndicator != "" {
-		// Reuse the handle resolved for commands[] if the LED is also a
-		// command target; otherwise look it up directly.
-		if h, ok := resources[conf.LEDIndicator]; ok {
-			ledIndicator = h
-		} else {
-			h, err := deps.Lookup(generic.Named(conf.LEDIndicator))
-			if err != nil {
-				return nil, fmt.Errorf("led_indicator resource %q not found: %w", conf.LEDIndicator, err)
-			}
-			ledIndicator = h
 		}
 	}
 
@@ -511,7 +494,6 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		resources:       resources,
 		sensors:         sensors,
 		commandStatus:   commandStatus,
-		ledIndicator:    ledIndicator,
 		wakeWord:        strings.ToLower(wake),
 		wakeCooldown:    cooldown,
 		listenTimeout:   listenTimeout,
@@ -588,7 +570,12 @@ func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	state := s.activityState
+	if state == "" {
+		state = "idle"
+	}
 	return map[string]interface{}{
+		"state":     state,
 		"wake_word": s.wakeWord,
 		"last_wake": s.lastWake.Format(time.RFC3339Nano),
 		"llm_model": string(s.anthropicModel),
@@ -716,18 +703,11 @@ func (s *service) run() {
 		}
 		s.logger.Infow("captured utterance", "text", utterance, "in_conversation", inConvo)
 
-		// LED enters "thinking" for the LLM call + TTS playback + any
-		// dispatched command. Held until we know whether the conversation
-		// continues (then the next listenForCommand cycle replaces it with
-		// listening) or ends (then we explicitly clear to idle below).
-		s.signalLED(s.workerCtx, ledThinkingPayload)
-
 		reply, newHistory, err := s.interpret(s.workerCtx, utterance, history)
 		if err != nil {
 			s.logger.Errorw("llm interpret failed", "err", err)
 			s.speak(s.workerCtx, "Sorry, I had trouble understanding that. Could you try again?")
 			s.endConversation()
-			s.signalLED(s.workerCtx, ledIdlePayload)
 			continue
 		}
 		// In conversation mode, drop utterances Claude judges weren't
@@ -740,8 +720,6 @@ func (s *service) run() {
 				"text", utterance,
 				"suppressed_response", reply.Response,
 				"suppressed_command", reply.Command)
-			// Conversation is still active; next listenForCommand cycle
-			// will signal listening, so no need to clear to idle here.
 			continue
 		}
 		// The user said something real — reset the consecutive-silence
@@ -767,8 +745,6 @@ func (s *service) run() {
 		// behavior but does not keep the conversation open on its own.
 		if reply.ContinueConversation {
 			s.extendConversation(newHistory, reply.CommandInProgress)
-			// Leave LED in thinking; the next listenForCommand cycle
-			// will signal listening as it enters stateListening.
 		} else {
 			// Play the wake-word reminder on every end-of-turn that
 			// doesn't continue the conversation — covers both the
@@ -777,7 +753,6 @@ func (s *service) run() {
 			// robot is idle and waiting for the next wake word.
 			s.speakEndCue(s.workerCtx)
 			s.endConversation()
-			s.signalLED(s.workerCtx, ledIdlePayload)
 		}
 	}
 }
@@ -807,10 +782,6 @@ const silenceMarker = "(the user has gone silent)"
 func (s *service) handleLull(history []anthropic.MessageParam) {
 	s.logger.Infow("conversation lull detected; generating nudge")
 
-	// Lull-nudge runs an LLM call + TTS playback; surface that as
-	// "thinking" so the user sees activity instead of dead air.
-	s.signalLED(s.workerCtx, ledThinkingPayload)
-
 	// Drop newHistory: the synthetic silence-marker turn and Claude's
 	// nudge response shouldn't be persisted into convoHistory. If they
 	// were, when the user finally speaks their real follow-up, Claude
@@ -823,7 +794,6 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 		s.logger.Errorw("lull interpret failed; ending conversation", "err", err)
 		s.speakEndCue(s.workerCtx)
 		s.endConversation()
-		s.signalLED(s.workerCtx, ledIdlePayload)
 		return
 	}
 
@@ -852,40 +822,11 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 			"lull_count", count, "min_lull_prompts", s.minLullPrompts)
 		s.speakEndCue(s.workerCtx)
 		s.endConversation()
-		s.signalLED(s.workerCtx, ledIdlePayload)
 		return
 	}
 	// Either Claude wants to keep going, or we're still under the minimum.
-	// Either way, extend the window and loop back to listening. LED stays
-	// in thinking; the next listenForCommand cycle will signal listening.
+	// Either way, extend the window and loop back to listening.
 	s.extendConversation(history, false)
-}
-
-// ledListeningPayload is the DoCommand fired at the configured LED indicator
-// when voice-command begins actively listening (post wake-word in wake mode,
-// or any turn in conversation mode). The shape matches the simple
-// state-based protocol the led-bridge model forwards over USB serial to the
-// indicator firmware.
-var ledListeningPayload = map[string]interface{}{"state": "listening"}
-
-// ledThinkingPayload is fired while voice-command is processing a captured
-// utterance — covering the LLM call, the TTS response playback, and any
-// dispatched command. Fills the visual gap between "stopped capturing
-// speech" and "started responding" so the user sees continuous activity.
-var ledThinkingPayload = map[string]interface{}{"state": "thinking"}
-
-// ledIdlePayload is the DoCommand fired when voice-command stops actively
-// listening (utterance committed, silence timeout, or stream ended) and
-// when a conversation closes cleanly.
-var ledIdlePayload = map[string]interface{}{"state": "idle"}
-
-func (s *service) signalLED(ctx context.Context, payload map[string]interface{}) {
-	if s.ledIndicator == nil {
-		return
-	}
-	if _, err := s.ledIndicator.DoCommand(ctx, payload); err != nil {
-		s.logger.Warnw("led indicator do_command failed", "err", err)
-	}
 }
 
 // listenForCommand opens a Google STT streaming session, pipes mic audio
@@ -893,6 +834,14 @@ func (s *service) signalLED(ctx context.Context, payload map[string]interface{})
 // is true), and returns the captured utterance once Google marks it final
 // (or earlier if the word-count cap is hit).
 func (s *service) listenForCommand(ctx context.Context, startInConversation bool) (string, error) {
+	// In a conversation follow-up we're immediately capturing; in wake mode
+	// we're idle until the wake word fires (see the stateListening transition
+	// below).
+	if startInConversation {
+		s.setActivity("listening")
+	} else {
+		s.setActivity("idle")
+	}
 	chunks, err := s.mic.GetAudio(ctx, "pcm16", 0, 0, nil)
 	if err != nil {
 		return "", fmt.Errorf("open mic: %w", err)
@@ -986,16 +935,6 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	if startInConversation {
 		state = stateListening
 	}
-	// firedListening tracks whether we ever signalled the LED into the
-	// listening state during this listen session. Used to gate the idle
-	// signal on exit so we don't spam the LED with idle commands on every
-	// STT stream cycle (e.g. Google's 305s reopens) while only waiting for
-	// a wake word.
-	var firedListening bool
-	if state == stateListening {
-		s.signalLED(ctx, ledListeningPayload)
-		firedListening = true
-	}
 	var captureBuf strings.Builder
 
 	// Two client-side commit triggers both feed into streamCancel; the
@@ -1067,12 +1006,6 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 		pipeCancel()
 		_ = sttStream.CloseSend()
 		pipeWG.Wait()
-		if firedListening {
-			// Use a background context: the listen ctx may already be
-			// cancelled here (silence timeout, stable endpoint), and we
-			// still want the LED to settle back to idle.
-			s.signalLED(context.Background(), ledIdlePayload)
-		}
 	}()
 
 	for {
@@ -1136,10 +1069,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				s.mu.Unlock()
 				s.logger.Infow("wake word detected", "transcript", transcript)
 				state = stateListening
-				if !firedListening {
-					s.signalLED(ctx, ledListeningPayload)
-					firedListening = true
-				}
+				s.setActivity("listening")
 				armListenTimeout()
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
 				// Short-circuit if we've already got enough to work with:
@@ -1334,6 +1264,7 @@ func (s *service) sensorContextBlock(ctx context.Context) string {
 // history back into the next interpret() call to maintain context across
 // a conversation window.
 func (s *service) interpret(ctx context.Context, utterance string, history []anthropic.MessageParam) (interpretedReply, []anthropic.MessageParam, error) {
+	s.setActivity("thinking")
 	userMsg := anthropic.NewUserMessage(anthropic.NewTextBlock(utterance))
 	msgs := append(append([]anthropic.MessageParam{}, history...), userMsg)
 
@@ -1392,6 +1323,7 @@ func (s *service) speak(ctx context.Context, text string) {
 	if text == "" || s.tts == nil {
 		return
 	}
+	s.setActivity("responding")
 	if _, err := s.tts.DoCommand(ctx, map[string]interface{}{"say": text}); err != nil {
 		s.logger.Errorw("tts say failed", "err", err, "text", text)
 	}
