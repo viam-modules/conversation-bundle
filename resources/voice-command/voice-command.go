@@ -570,6 +570,13 @@ func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	// structpb.NewStruct (RDK's GetStatus serializer) rejects []string for
+	// list values — they must be []interface{}, or the whole GetStatus call
+	// errors over the wire. Convert before returning.
+	commands := make([]interface{}, len(names))
+	for i, n := range names {
+		commands[i] = n
+	}
 	state := s.activityState
 	if state == "" {
 		state = "idle"
@@ -580,7 +587,7 @@ func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 		"last_wake": s.lastWake.Format(time.RFC3339Nano),
 		"llm_model": string(s.anthropicModel),
 		"language":  s.languageCode,
-		"commands":  names,
+		"commands":  commands,
 	}, nil
 }
 
