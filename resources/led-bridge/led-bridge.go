@@ -111,6 +111,11 @@ type bridge struct {
 	source resource.Resource
 	poll   time.Duration
 
+	// serialPort and baudRate are retained for Status reporting; the
+	// underlying serial.Port doesn't expose them back.
+	serialPort string
+	baudRate   int
+
 	// writeMu serializes writes so the poll loop and any manual DoCommand
 	// don't interleave bytes on the wire.
 	writeMu sync.Mutex
@@ -119,6 +124,16 @@ type bridge struct {
 	// only on change and to answer Status().
 	mu        sync.Mutex
 	lastState string
+
+	// statsMu protects the diagnostic counters below. Kept separate from
+	// writeMu so a Status query never blocks behind a slow port.Write —
+	// operators need diagnostics most when the wire is misbehaving.
+	statsMu      sync.Mutex
+	messagesSent int64
+	bytesSent    int64
+	lastSentAt   time.Time
+	lastError    string
+	lastErrorAt  time.Time
 
 	workerCtx    context.Context
 	workerCancel context.CancelFunc
@@ -157,6 +172,8 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 		port:         port,
 		source:       source,
 		poll:         poll,
+		serialPort:   conf.SerialPort,
+		baudRate:     baud,
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
 	}
@@ -212,26 +229,62 @@ func (b *bridge) tick() {
 	}
 }
 
-// write marshals a payload to line-delimited JSON and sends it over serial.
+// write marshals a payload to line-delimited JSON, sends it over serial, and
+// records the outcome in the diagnostic counters surfaced by Status().
 func (b *bridge) write(payload map[string]interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 	b.writeMu.Lock()
-	defer b.writeMu.Unlock()
 	// Trailing newline is the firmware's line delimiter — without it the
 	// device buffers indefinitely waiting for end-of-line.
-	if _, err := b.port.Write(append(data, '\n')); err != nil {
-		return fmt.Errorf("write to serial port: %w", err)
+	n, werr := b.port.Write(append(data, '\n'))
+	b.writeMu.Unlock()
+
+	b.statsMu.Lock()
+	if werr != nil {
+		b.lastError = werr.Error()
+		b.lastErrorAt = time.Now()
+	} else {
+		b.messagesSent++
+		b.bytesSent += int64(n)
+		b.lastSentAt = time.Now()
+	}
+	b.statsMu.Unlock()
+
+	if werr != nil {
+		return fmt.Errorf("write to serial port: %w", werr)
 	}
 	return nil
 }
 
+// Status reports the last state we acted on plus serial-write health — which
+// port/baud we're on, how many messages/bytes have gone out, when the last
+// one was, and the last error if any. Lets an operator confirm from the
+// dashboard whether the LED is actually wired up and receiving data.
 func (b *bridge) Status(ctx context.Context) (map[string]interface{}, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return map[string]interface{}{"last_state": b.lastState}, nil
+	lastState := b.lastState
+	b.mu.Unlock()
+
+	b.statsMu.Lock()
+	defer b.statsMu.Unlock()
+	status := map[string]interface{}{
+		"last_state":    lastState,
+		"serial_port":   b.serialPort,
+		"baud_rate":     b.baudRate,
+		"messages_sent": b.messagesSent,
+		"bytes_sent":    b.bytesSent,
+	}
+	if !b.lastSentAt.IsZero() {
+		status["last_sent_at"] = b.lastSentAt.Format(time.RFC3339Nano)
+	}
+	if b.lastError != "" {
+		status["last_error"] = b.lastError
+		status["last_error_at"] = b.lastErrorAt.Format(time.RFC3339Nano)
+	}
+	return status, nil
 }
 
 // DoCommand allows manually pushing a raw payload to the firmware, mostly for
