@@ -1,7 +1,8 @@
 // Package ledbridge provides the viam:conversation-bundle:led-bridge model,
 // a generic resource that PULLS lifecycle state from another resource and
-// drives a USB-serial-attached LED indicator firmware (see
-// firmware/led-indicator/ for the ESP32 sketch) to match.
+// drives a USB-serial-attached LED indicator firmware to match. The firmware
+// is a separate ESP32 sketch flashed to the indicator hardware, not part of
+// this repo.
 //
 // The component it watches is named by `status_source` and is depended on,
 // so it is built first. led-bridge polls that source's Status() on an
@@ -53,8 +54,8 @@ type Config struct {
 	// flow.
 	StatusSource string `json:"status_source"`
 
-	// BaudRate is optional; defaults to 115200, matching the firmware
-	// sketches in this repo. Override only if you've modified the firmware.
+	// BaudRate is optional; defaults to 115200, matching the indicator
+	// firmware. Override only if you've modified the firmware.
 	BaudRate int `json:"baud_rate,omitempty"`
 
 	// PollIntervalMs is optional; defaults to 200ms. How often to read the
@@ -76,27 +77,19 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 }
 
 // actionForState maps a source lifecycle state to the JSON payload written to
-// the LED firmware. This is the entire "opinion" of led-bridge — what each
-// state looks like on the strip. The bool is false for states we choose to
-// ignore (no write).
+// the LED firmware, and acts as an allow-list: the bool is false for states
+// we don't recognize, which the caller treats as "leave the LED as-is".
 //
-// TODO(you): design the real payloads your firmware understands. The four
-// states voice-command emits are "idle", "listening", "thinking", and
-// "responding". The placeholders below just forward the state name so the
-// pipeline works end-to-end; replace them with whatever your firmware
-// expects (colors, animations, brightness, etc.).
+// By design the payload just forwards the state word ({"state": "<state>"});
+// the firmware owns the visuals (color, animation, brightness) and matches on
+// that word. This keeps led-bridge decoupled from the firmware — the strip can
+// be redesigned without touching this code. To make a state drive richer
+// behavior from the Go side instead, return a fuller payload here.
 func actionForState(state string) (map[string]interface{}, bool) {
 	switch state {
-	case "idle":
-		return map[string]interface{}{"state": "idle"}, true
-	case "listening":
-		return map[string]interface{}{"state": "listening"}, true
-	case "thinking":
-		return map[string]interface{}{"state": "thinking"}, true
-	case "responding":
-		return map[string]interface{}{"state": "responding"}, true
+	case "idle", "listening", "thinking", "responding":
+		return map[string]interface{}{"state": state}, true
 	default:
-		// Unknown state — leave the LED as-is rather than guessing.
 		return nil, false
 	}
 }
@@ -213,20 +206,28 @@ func (b *bridge) tick() {
 
 	b.mu.Lock()
 	changed := state != b.lastState
-	b.lastState = state
 	b.mu.Unlock()
 	if !changed {
 		return
 	}
 
 	payload, ok := actionForState(state)
-	if !ok {
+	if ok {
+		if err := b.write(payload); err != nil {
+			// Leave lastState unchanged so the next tick retries the write —
+			// a transient serial hiccup self-heals once the port recovers.
+			// write() records and logs the error.
+			return
+		}
+	} else {
 		b.logger.Debugw("no action mapped for state; leaving LED unchanged", "state", state)
-		return
 	}
-	if err := b.write(payload); err != nil {
-		b.logger.Warnw("led write failed", "state", state, "err", err)
-	}
+
+	// Commit the state only once we've handled it (written, or deliberately
+	// ignored) so we don't re-process the same value every tick.
+	b.mu.Lock()
+	b.lastState = state
+	b.mu.Unlock()
 }
 
 // write marshals a payload to line-delimited JSON, sends it over serial, and
@@ -244,7 +245,14 @@ func (b *bridge) write(payload map[string]interface{}) error {
 
 	b.statsMu.Lock()
 	if werr != nil {
-		b.lastError = werr.Error()
+		msg := werr.Error()
+		// Dedupe the log: only warn when the error changes, so a persistently
+		// broken port (retried every tick) doesn't flood the logs. Status()
+		// still surfaces the sticky last_error/last_error_at for diagnosis.
+		if msg != b.lastError {
+			b.logger.Warnw("led serial write failed", "err", msg)
+		}
+		b.lastError = msg
 		b.lastErrorAt = time.Now()
 	} else {
 		b.messagesSent++
