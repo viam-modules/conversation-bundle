@@ -1,6 +1,7 @@
 package main
 
 import (
+	ledbridge "conversationbundle/resources/led-bridge"
 	texttospeech "conversationbundle/resources/text-to-speech"
 	voicecommand "conversationbundle/resources/voice-command"
 	weathersensor "conversationbundle/resources/weather-sensor"
@@ -16,6 +17,7 @@ func main() {
 	module.ModularMain(
 		resource.APIModel{API: generic.API, Model: texttospeech.Model},
 		resource.APIModel{API: generic.API, Model: voicecommand.Model},
+		resource.APIModel{API: generic.API, Model: ledbridge.Model},
 		resource.APIModel{API: sensor.API, Model: weathersensor.Model},
 	)
 }

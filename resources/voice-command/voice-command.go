@@ -338,6 +338,17 @@ type service struct {
 	// of triggering a nudge — nudges only keep the user engaged while
 	// something is actually running.
 	lastCmdInProgress bool
+	// activityState is the current lifecycle state ("idle", "listening",
+	// "thinking", "responding"), surfaced via Status() for consumers like an
+	// LED indicator to pull. Empty reads as "idle".
+	activityState string
+}
+
+// setActivity records the current lifecycle state for Status() consumers.
+func (s *service) setActivity(state string) {
+	s.mu.Lock()
+	s.activityState = state
+	s.mu.Unlock()
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -557,12 +568,23 @@ func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	// RDK's GetStatus serializer (structpb) rejects []string; list values must
+	// be []interface{} or the whole call errors over the wire.
+	commands := make([]interface{}, len(names))
+	for i, n := range names {
+		commands[i] = n
+	}
+	state := s.activityState
+	if state == "" {
+		state = "idle"
+	}
 	return map[string]interface{}{
+		"state":     state,
 		"wake_word": s.wakeWord,
 		"last_wake": s.lastWake.Format(time.RFC3339Nano),
 		"llm_model": string(s.anthropicModel),
 		"language":  s.languageCode,
-		"commands":  names,
+		"commands":  commands,
 	}, nil
 }
 
@@ -816,6 +838,12 @@ func (s *service) handleLull(history []anthropic.MessageParam) {
 // is true), and returns the captured utterance once Google marks it final
 // (or earlier if the word-count cap is hit).
 func (s *service) listenForCommand(ctx context.Context, startInConversation bool) (string, error) {
+	// Follow-up: capturing immediately. Wake mode: idle until the wake word.
+	if startInConversation {
+		s.setActivity("listening")
+	} else {
+		s.setActivity("idle")
+	}
 	chunks, err := s.mic.GetAudio(ctx, "pcm16", 0, 0, nil)
 	if err != nil {
 		return "", fmt.Errorf("open mic: %w", err)
@@ -1043,6 +1071,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				s.mu.Unlock()
 				s.logger.Infow("wake word detected", "transcript", transcript)
 				state = stateListening
+				s.setActivity("listening")
 				armListenTimeout()
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
 				// Short-circuit if we've already got enough to work with:
@@ -1237,6 +1266,7 @@ func (s *service) sensorContextBlock(ctx context.Context) string {
 // history back into the next interpret() call to maintain context across
 // a conversation window.
 func (s *service) interpret(ctx context.Context, utterance string, history []anthropic.MessageParam) (interpretedReply, []anthropic.MessageParam, error) {
+	s.setActivity("thinking")
 	userMsg := anthropic.NewUserMessage(anthropic.NewTextBlock(utterance))
 	msgs := append(append([]anthropic.MessageParam{}, history...), userMsg)
 
@@ -1295,6 +1325,7 @@ func (s *service) speak(ctx context.Context, text string) {
 	if text == "" || s.tts == nil {
 		return
 	}
+	s.setActivity("responding")
 	if _, err := s.tts.DoCommand(ctx, map[string]interface{}{"say": text}); err != nil {
 		s.logger.Errorw("tts say failed", "err", err, "text", text)
 	}
