@@ -24,6 +24,7 @@ var Model = resource.NewModel("viam", "conversation-bundle", "led-bridge")
 const (
 	defaultBaudRate     = 115200
 	defaultPollInterval = 200 * time.Millisecond
+	defaultStateKey     = "state"
 )
 
 func init() {
@@ -39,9 +40,13 @@ type Config struct {
 	// /dev/cu.usbserial-XXXX on macOS).
 	SerialPort string `json:"serial_port"`
 
-	// StatusSource is the resource to watch; led-bridge reacts to the "state"
-	// field of its Status(). Any resource exposing a "state" string works.
+	// StatusSource is the resource to watch; led-bridge reacts to the StateKey
+	// field of its Status(). Any resource exposing that key as a string works.
 	StatusSource string `json:"status_source"`
+
+	// StateKey is the field in status_source's Status() map to read. Optional;
+	// defaults to "state".
+	StateKey string `json:"state_key,omitempty"`
 
 	// BaudRate is optional; defaults to 115200 to match the firmware.
 	BaudRate int `json:"baud_rate,omitempty"`
@@ -81,9 +86,10 @@ type bridge struct {
 	name   resource.Name
 	logger logging.Logger
 
-	port   serial.Port
-	source resource.Resource
-	poll   time.Duration
+	port         serial.Port
+	source       resource.Resource
+	pollInterval time.Duration
+	stateKey     string
 
 	// serialPort and baudRate are kept for Status reporting.
 	serialPort string
@@ -119,9 +125,13 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 	if baud <= 0 {
 		baud = defaultBaudRate
 	}
-	poll := defaultPollInterval
+	pollInterval := defaultPollInterval
 	if conf.PollIntervalMs > 0 {
-		poll = time.Duration(conf.PollIntervalMs) * time.Millisecond
+		pollInterval = time.Duration(conf.PollIntervalMs) * time.Millisecond
+	}
+	stateKey := conf.StateKey
+	if stateKey == "" {
+		stateKey = defaultStateKey
 	}
 
 	source, err := deps.Lookup(generic.Named(conf.StatusSource))
@@ -141,7 +151,8 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 		logger:       logger,
 		port:         port,
 		source:       source,
-		poll:         poll,
+		pollInterval: pollInterval,
+		stateKey:     stateKey,
 		serialPort:   conf.SerialPort,
 		baudRate:     baud,
 		workerCtx:    workerCtx,
@@ -155,10 +166,10 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 func (b *bridge) Name() resource.Name { return b.name }
 
 // run polls the source's Status() and writes to the firmware whenever the
-// reported "state" changes.
+// reported state changes.
 func (b *bridge) run() {
 	defer b.workerWG.Done()
-	ticker := time.NewTicker(b.poll)
+	ticker := time.NewTicker(b.pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -176,7 +187,7 @@ func (b *bridge) tick() {
 		b.logger.Warnw("status_source Status() failed", "err", err)
 		return
 	}
-	state, _ := status["state"].(string)
+	state, _ := status[b.stateKey].(string)
 	if state == "" {
 		return
 	}
