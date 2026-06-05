@@ -8,6 +8,7 @@ package ledbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -25,7 +26,14 @@ const (
 	defaultBaudRate     = 115200
 	defaultPollInterval = 200 * time.Millisecond
 	defaultStateKey     = "state"
+	// reconnectBackoff throttles reconnect attempts while the device is down.
+	// Opening the port resets the ESP, so unthrottled retries would reboot-loop it.
+	reconnectBackoff = 2 * time.Second
 )
+
+// errBackoff means the port is disconnected and we're waiting out
+// reconnectBackoff before redialing — not a real I/O failure to report.
+var errBackoff = errors.New("serial reconnect backoff")
 
 func init() {
 	resource.RegisterService(generic.API, Model,
@@ -86,23 +94,23 @@ type bridge struct {
 	name   resource.Name
 	logger logging.Logger
 
-	port         serial.Port
 	source       resource.Resource
 	pollInterval time.Duration
 	stateKey     string
 
-	// serialPort and baudRate are kept for Status reporting.
-	serialPort string
+	// connMu guards the serial connection (port, lastDial) and serializes
+	// writes so bytes don't interleave. port is nil while disconnected.
+	connMu     sync.Mutex
+	port       serial.Port
+	lastDial   time.Time
+	serialPort string // connection params: kept for reconnect + Status.
 	baudRate   int
-
-	// writeMu serializes serial writes so bytes don't interleave.
-	writeMu sync.Mutex
 
 	// mu guards lastState (the state we last acted on; used to write on change).
 	mu        sync.Mutex
 	lastState string
 
-	// statsMu guards the diagnostic counters. Separate from writeMu so a Status
+	// statsMu guards the diagnostic counters. Separate from connMu so a Status
 	// query never blocks behind a slow port.Write.
 	statsMu      sync.Mutex
 	messagesSent int64
@@ -139,17 +147,10 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 		return nil, fmt.Errorf("status_source %q not found: %w", conf.StatusSource, err)
 	}
 
-	port, err := serial.Open(conf.SerialPort, &serial.Mode{BaudRate: baud})
-	if err != nil {
-		return nil, fmt.Errorf("open serial port %q at %d baud: %w", conf.SerialPort, baud, err)
-	}
-	logger.Infow("led-bridge serial port opened", "port", conf.SerialPort, "baud", baud, "status_source", conf.StatusSource)
-
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	b := &bridge{
 		name:         rawConf.ResourceName(),
 		logger:       logger,
-		port:         port,
 		source:       source,
 		pollInterval: pollInterval,
 		stateKey:     stateKey,
@@ -157,6 +158,16 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 		baudRate:     baud,
 		workerCtx:    workerCtx,
 		workerCancel: workerCancel,
+	}
+	// Connect now so a healthy device works immediately and a bad port surfaces
+	// in the logs — but don't fail construction if the device is absent; the
+	// poll loop reconnects when it appears.
+	b.connMu.Lock()
+	_, oerr := b.openLocked()
+	b.connMu.Unlock()
+	if oerr != nil {
+		logger.Warnw("led-bridge serial port unavailable; will keep retrying",
+			"port", conf.SerialPort, "err", oerr)
 	}
 	b.workerWG.Add(1)
 	go b.run()
@@ -216,53 +227,110 @@ func (b *bridge) tick() {
 	b.mu.Unlock()
 }
 
-// write sends payload as line-delimited JSON over serial and records the
-// outcome in the diagnostic counters surfaced by Status().
+// write sends payload as line-delimited JSON over serial, (re)connecting the
+// port as needed, and records the outcome in the diagnostic counters surfaced
+// by Status().
 func (b *bridge) write(payload map[string]interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
-	b.writeMu.Lock()
-	// Trailing newline is the firmware's line delimiter.
-	n, werr := b.port.Write(append(data, '\n'))
-	b.writeMu.Unlock()
+	line := append(data, '\n')
 
-	b.statsMu.Lock()
-	if werr != nil {
-		msg := werr.Error()
-		// Warn only when the error changes, so a persistently broken port
-		// (retried every tick) doesn't flood the logs.
-		if msg != b.lastError {
-			b.logger.Warnw("led serial write failed", "err", msg)
+	b.connMu.Lock()
+	port, err := b.openLocked()
+	if err != nil {
+		b.connMu.Unlock()
+		if errors.Is(err, errBackoff) {
+			return err // device known-down; waiting out the backoff, stay quiet
 		}
-		b.lastError = msg
-		b.lastErrorAt = time.Now()
-	} else {
-		b.messagesSent++
-		b.bytesSent += int64(n)
-		b.lastSentAt = time.Now()
+		b.recordError(err)
+		return err
 	}
-	b.statsMu.Unlock()
+	// Trailing newline is the firmware's line delimiter.
+	n, werr := port.Write(line)
+	if werr != nil {
+		// Stale handle (the device reset/reconnected) — drop it so the next
+		// write reconnects to the live device.
+		b.closeLocked()
+	}
+	b.connMu.Unlock()
 
 	if werr != nil {
+		b.recordError(werr)
 		return fmt.Errorf("write to serial port: %w", werr)
 	}
+	b.recordSuccess(n)
 	return nil
 }
 
-// Status reports the last state acted on plus serial-write health (port, baud,
-// message/byte counts, last send, last error) so an operator can confirm the
-// LED is wired up and receiving data.
+// openLocked returns a healthy serial port, opening it if needed. Caller must
+// hold connMu. Reconnect attempts are throttled by reconnectBackoff so an
+// absent device isn't dialed every tick.
+func (b *bridge) openLocked() (serial.Port, error) {
+	if b.port != nil {
+		return b.port, nil
+	}
+	if time.Since(b.lastDial) < reconnectBackoff {
+		return nil, errBackoff
+	}
+	b.lastDial = time.Now()
+	port, err := serial.Open(b.serialPort, &serial.Mode{BaudRate: b.baudRate})
+	if err != nil {
+		return nil, err
+	}
+	b.port = port
+	b.logger.Infow("led-bridge serial port opened", "port", b.serialPort, "baud", b.baudRate)
+	return port, nil
+}
+
+// closeLocked closes and clears the port so the next openLocked reconnects.
+// Caller must hold connMu.
+func (b *bridge) closeLocked() {
+	if b.port != nil {
+		_ = b.port.Close()
+		b.port = nil
+	}
+}
+
+func (b *bridge) recordSuccess(n int) {
+	b.statsMu.Lock()
+	b.messagesSent++
+	b.bytesSent += int64(n)
+	b.lastSentAt = time.Now()
+	b.statsMu.Unlock()
+}
+
+// recordError updates the diagnostic counters and warns — but only when the
+// error changes, so a persistently failing port doesn't flood the logs.
+func (b *bridge) recordError(err error) {
+	msg := err.Error()
+	b.statsMu.Lock()
+	if msg != b.lastError {
+		b.logger.Warnw("led serial write failed", "err", msg)
+	}
+	b.lastError = msg
+	b.lastErrorAt = time.Now()
+	b.statsMu.Unlock()
+}
+
+// Status reports the last state acted on plus connection/serial-write health
+// (connected, port, baud, message/byte counts, last send, last error) so an
+// operator can confirm the LED is wired up and receiving data.
 func (b *bridge) Status(ctx context.Context) (map[string]interface{}, error) {
 	b.mu.Lock()
 	lastState := b.lastState
 	b.mu.Unlock()
 
+	b.connMu.Lock()
+	connected := b.port != nil
+	b.connMu.Unlock()
+
 	b.statsMu.Lock()
 	defer b.statsMu.Unlock()
 	status := map[string]interface{}{
 		"last_state":    lastState,
+		"connected":     connected,
 		"serial_port":   b.serialPort,
 		"baud_rate":     b.baudRate,
 		"messages_sent": b.messagesSent,
@@ -296,6 +364,8 @@ func (b *bridge) Close(ctx context.Context) error {
 		b.workerCancel()
 	}
 	b.workerWG.Wait()
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
 	if b.port != nil {
 		return b.port.Close()
 	}
