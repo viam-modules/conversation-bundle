@@ -874,15 +874,16 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 		return "", fmt.Errorf("open STT stream: %w", err)
 	}
 	// Send config first.
-	// Only enable Google's single_utterance mode in conversation follow-up
-	// mode. There, it gives snappy turn-taking (~200-500ms after the user
-	// stops talking). In wake mode we keep it OFF — otherwise every
-	// ambient utterance from colleagues in the room terminates our STT
-	// stream, forcing a ~4s reopen cycle during which we can't hear the
-	// wake word. With single_utterance off, the stream stays open until
-	// we close it (or the 305s limit); wake-mode latency is then capped
-	// by our own listen-timeout (after wake-word detection) and the
-	// max-utterance-words cap.
+	// Keep Google's single_utterance mode OFF in both wake and conversation
+	// modes. With it on, Google's VAD ends the turn ~200-500ms after a pause,
+	// which clips users mid-sentence on natural pauses (and in wake mode lets
+	// any ambient utterance from colleagues terminate the stream, forcing a
+	// ~4s reopen cycle during which we can't hear the wake word). With it off,
+	// the stream stays open until we close it (or the 305s limit) and our own
+	// stable-endpoint timer governs the commit: that timer resets on every new
+	// word (see onContentChange), so it only fires once the user has truly
+	// stopped — and is tunable via stable_endpoint_ms. Latency is then capped
+	// by our listen-timeout and the max-utterance-words cap.
 	if err := sttStream.Send(&speechpb.StreamingRecognizeRequest{
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 			StreamingConfig: &speechpb.StreamingRecognitionConfig{
@@ -892,7 +893,7 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 					LanguageCode:    s.languageCode,
 				},
 				InterimResults:  true,
-				SingleUtterance: startInConversation,
+				SingleUtterance: false,
 			},
 		},
 	}); err != nil {

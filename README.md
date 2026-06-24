@@ -81,3 +81,9 @@ Returns:
 ```json
 {"queued": "Hello, your espresso is ready!"}
 ```
+
+---
+
+## Reference: LED indicator firmware
+
+Example ESP32 firmware for the LED indicator driven by `led-bridge` lives at [`resources/led-bridge/firmware/led-indicator.ino`](resources/led-bridge/firmware/led-indicator.ino).
