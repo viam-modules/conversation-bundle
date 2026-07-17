@@ -340,8 +340,16 @@ type service struct {
 	lastCmdInProgress bool
 	// activityState is the current lifecycle state ("idle", "listening",
 	// "thinking", "responding"), surfaced via Status() for consumers like an
-	// LED indicator to pull. Empty reads as "idle".
+	// LED indicator to pull. Empty reads as "idle". Status() reports "error"
+	// instead while the command_status resource raises fault_active (see
+	// pollCommandFault) — activityState itself never holds "error".
 	activityState string
+
+	// faultCached is the last fault_active value read from the command_status
+	// resource by the pollCommandFault background loop. Status() reads it
+	// directly so a hot Status() poll (led-bridge hits it ~5x/s) never fans
+	// out into a nested RPC. Zero value (false) until the first poll.
+	faultCached atomic.Bool
 }
 
 // setActivity records the current lifecycle state for Status() consumers.
@@ -509,6 +517,10 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	s.workerCtx, s.workerCancel = context.WithCancel(context.Background())
 	s.workerWG.Add(1)
 	go s.run()
+	if s.commandStatus != nil {
+		s.workerWG.Add(1)
+		go s.pollCommandFault()
+	}
 	return s, nil
 }
 
@@ -560,7 +572,47 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 
 func (s *service) Name() resource.Name { return s.name }
 
+// commandFaultPollInterval is how often pollCommandFault refreshes faultCached.
+// The poll runs off the Status() hot path (led-bridge hits Status() ~5x/s), so
+// this bounds how stale the cached flag can be without coupling the RPC rate to
+// the poll rate; well under the source's fault window (a few seconds).
+const commandFaultPollInterval = 500 * time.Millisecond
+
+// pollCommandFault refreshes faultCached from the command_status resource until
+// workerCtx is cancelled. Started from New only when a command_status resource
+// is configured, so faultCached stays false otherwise.
+func (s *service) pollCommandFault() {
+	defer s.workerWG.Done()
+	ticker := time.NewTicker(commandFaultPollInterval)
+	defer ticker.Stop()
+	for {
+		s.faultCached.Store(s.fetchCommandFault())
+		select {
+		case <-s.workerCtx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// fetchCommandFault reads the conventional fault_active flag from the
+// command_status resource's Status(). A missing flag or fetch failure reads as
+// "no fault". The call is bounded so a wedged source can't stall the poller.
+func (s *service) fetchCommandFault() bool {
+	ctx, cancel := context.WithTimeout(s.workerCtx, time.Second)
+	defer cancel()
+	status, err := s.commandStatus.handle.Status(ctx)
+	if err != nil {
+		s.logger.Debugw("command status fetch for fault flag failed",
+			"resource", s.commandStatus.name, "err", err)
+		return false
+	}
+	active, _ := status["fault_active"].(bool)
+	return active
+}
+
 func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
+	faultActive := s.faultCached.Load()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	names := make([]string, 0, len(s.commands))
@@ -577,6 +629,13 @@ func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
 	state := s.activityState
 	if state == "" {
 		state = "idle"
+	}
+	// A raised fault outranks conversation activity: consumers like led-bridge
+	// forward state changes to the LED indicator, and a failure should show
+	// even mid-conversation. The flag is transient on the source, so state
+	// reverts on its own when the source lowers it.
+	if faultActive {
+		state = "error"
 	}
 	return map[string]interface{}{
 		"state":     state,

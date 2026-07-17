@@ -81,7 +81,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 // to drive richer behavior from Go instead.
 func actionForState(state string) (map[string]interface{}, bool) {
 	switch state {
-	case "idle", "listening", "thinking", "responding":
+	case "idle", "listening", "thinking", "responding", "error":
 		return map[string]interface{}{"state": state}, true
 	default:
 		return nil, false
