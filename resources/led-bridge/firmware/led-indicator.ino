@@ -19,6 +19,7 @@
 //   - "listening"   -> solid blue
 //   - "thinking"    -> orange sine pulse (~800ms period)
 //   - "responding"  -> solid orange
+//   - "error"       -> red flash (~400ms on/off) until another state arrives
 // Any line without a recognized keyword is logged and ignored.
 
 #include <Adafruit_NeoPixel.h>
@@ -30,7 +31,7 @@ const uint8_t BRIGHTNESS = 80;
 
 Adafruit_NeoPixel strip(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-enum Mode { MODE_IDLE, MODE_LISTENING, MODE_THINKING, MODE_RESPONDING };
+enum Mode { MODE_IDLE, MODE_LISTENING, MODE_THINKING, MODE_RESPONDING, MODE_ERROR };
 Mode currentMode = MODE_IDLE;
 String inputBuffer;
 
@@ -84,6 +85,9 @@ void handleLine(const String &line) {
   } else if (line.indexOf("responding") >= 0) {
     currentMode = MODE_RESPONDING;
     Serial.println("-> mode: responding");
+  } else if (line.indexOf("error") >= 0) {
+    currentMode = MODE_ERROR;
+    Serial.println("-> mode: error");
   } else {
     Serial.println("-> unrecognized, ignoring");
   }
@@ -128,6 +132,15 @@ void render() {
       break;
     case MODE_RESPONDING:
       solidColor(255, 140, 0);
+      break;
+    case MODE_ERROR:
+      // Square-wave red flash, ~400ms on/off.
+      if ((millis() / 400) % 2 == 0) {
+        solidColor(255, 0, 0);
+      } else {
+        strip.clear();
+        strip.show();
+      }
       break;
   }
 }
