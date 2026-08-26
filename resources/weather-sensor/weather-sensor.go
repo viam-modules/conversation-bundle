@@ -35,15 +35,15 @@ func init() {
 // Null Island (0,0) is treated as "unset" — nobody realistically wants
 // weather for that point, so we fall back to NYC.
 const (
-	defaultLatitude  = 40.7128  // New York City
+	defaultLatitude  = 40.7128 // New York City
 	defaultLongitude = -74.0060
 )
 
 type Config struct {
 	Latitude    float64 `json:"latitude,omitempty"`
 	Longitude   float64 `json:"longitude,omitempty"`
-	Unit        string  `json:"unit,omitempty"`           // "imperial" or "metric" — default "imperial"
-	CacheTTLSec float64 `json:"cache_ttl_sec,omitempty"`  // default 60s
+	Unit        string  `json:"unit,omitempty"`          // "imperial" or "metric" — default "imperial"
+	CacheTTLSec float64 `json:"cache_ttl_sec,omitempty"` // default 60s
 }
 
 func (c *Config) Validate(path string) ([]string, []string, error) {
