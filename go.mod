@@ -7,7 +7,7 @@ require (
 	cloud.google.com/go/texttospeech v1.19.0
 	github.com/anthropics/anthropic-sdk-go v1.37.0
 	go.bug.st/serial v1.7.0
-	go.viam.com/rdk v1.5.0
+	go.viam.com/rdk v1.6.0
 	google.golang.org/api v0.276.0
 )
 
