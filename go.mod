@@ -7,7 +7,7 @@ require (
 	cloud.google.com/go/texttospeech v1.19.0
 	github.com/anthropics/anthropic-sdk-go v1.37.0
 	go.bug.st/serial v1.7.0
-	go.viam.com/rdk v1.12.0
+	go.viam.com/rdk v1.13.0
 	google.golang.org/api v0.278.0
 )
 
@@ -197,9 +197,9 @@ require (
 	go.uber.org/goleak v1.3.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
-	go.viam.com/api v0.1.590 // indirect
+	go.viam.com/api v0.1.597 // indirect
 	go.viam.com/test v1.2.5 // indirect
-	go.viam.com/utils v0.14.0 // indirect
+	go.viam.com/utils v0.14.1 // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20230525183740-e7c30c78aeb2 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20260611194520-c48552f49976 // indirect
