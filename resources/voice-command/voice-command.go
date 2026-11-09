@@ -167,6 +167,16 @@ type Config struct {
 	// negative value to disable and fall back to is_final / maxWords only.
 	StableEndpointMs int `json:"stable_endpoint_ms,omitempty"`
 
+	// WakeOnlyGraceMs handles the user saying the wake word and pausing:
+	// once Google finalizes a segment containing nothing but the wake word,
+	// we keep listening for this long. If the user carries on, their
+	// command is captured as usual; if not, the wake-word phrase itself
+	// (e.g. "hi beanjamin") is sent to the LLM so it can greet the user
+	// and open a conversation. Default 2500ms. Set to a negative value to
+	// disable the greeting fallback and keep listening until the listen
+	// timeout instead. Has no effect if it exceeds listen_timeout_sec.
+	WakeOnlyGraceMs int `json:"wake_only_grace_ms,omitempty"`
+
 	// ConversationEndCue is spoken when an active conversation window ends
 	// (either because Claude signaled end or the timer expired) to remind
 	// the user they'll need to say the wake word to re-engage. Omit the
@@ -307,6 +317,7 @@ type service struct {
 	listenTimeout  time.Duration
 	maxWords       int
 	stableEndpoint time.Duration
+	wakeOnlyGrace  time.Duration
 	endCue         string
 	minLullPrompts int
 	languageCode   string
@@ -464,6 +475,16 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 	default:
 		stableEndpoint = time.Duration(conf.StableEndpointMs) * time.Millisecond
 	}
+	// WakeOnlyGraceMs == 0 means unset, use default. Negative disables.
+	var wakeOnlyGrace time.Duration
+	switch {
+	case conf.WakeOnlyGraceMs == 0:
+		wakeOnlyGrace = 2500 * time.Millisecond
+	case conf.WakeOnlyGraceMs < 0:
+		wakeOnlyGrace = 0
+	default:
+		wakeOnlyGrace = time.Duration(conf.WakeOnlyGraceMs) * time.Millisecond
+	}
 	// Omitted = default cue naming the wake word; explicit "" = suppress.
 	var endCue string
 	if conf.ConversationEndCue == nil {
@@ -505,6 +526,7 @@ func New(ctx context.Context, deps resource.Dependencies, name resource.Name, co
 		listenTimeout:   listenTimeout,
 		maxWords:        maxWords,
 		stableEndpoint:  stableEndpoint,
+		wakeOnlyGrace:   wakeOnlyGrace,
 		endCue:          endCue,
 		minLullPrompts:  minLullPrompts,
 		languageCode:    lang,
@@ -1011,13 +1033,31 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 	// stableTimer: once captured content stops changing, we wait
 	// stableEndpoint before committing — beats Google's ~1-2s internal
 	// VAD on short utterances without closing the stream.
+	//
+	// wakeOnlyTimer: armed when Google finalizes a segment that holds only
+	// the wake word (the user paused right after it). If no further speech
+	// arrives before it fires, the wake phrase itself becomes the utterance.
 	var (
 		listenTimer       *time.Timer
 		listenTimerFired  atomic.Bool
 		stableTimer       *time.Timer
 		stableTimerFired  atomic.Bool
+		wakeOnlyTimer     *time.Timer
+		wakeOnlyFired     atomic.Bool
+		wakePhrase        string
 		lastStableContent string
 	)
+	armWakeOnlyTimer := func() {
+		if wakeOnlyTimer != nil || s.wakeOnlyGrace <= 0 {
+			return
+		}
+		s.logger.Infow("wake word alone; waiting for the rest of the utterance",
+			"wake_phrase", wakePhrase, "grace", s.wakeOnlyGrace)
+		wakeOnlyTimer = time.AfterFunc(s.wakeOnlyGrace, func() {
+			wakeOnlyFired.Store(true)
+			streamCancel()
+		})
+	}
 	armListenTimeout := func() {
 		if listenTimer != nil {
 			return
@@ -1039,6 +1079,9 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 			return
 		}
 		lastStableContent = content
+		if wakeOnlyTimer != nil {
+			wakeOnlyTimer.Stop()
+		}
 		if listenTimer != nil {
 			listenTimer.Reset(s.listenTimeout)
 		}
@@ -1065,6 +1108,9 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 		if stableTimer != nil {
 			stableTimer.Stop()
 		}
+		if wakeOnlyTimer != nil {
+			wakeOnlyTimer.Stop()
+		}
 		pipeCancel()
 		_ = sttStream.CloseSend()
 		pipeWG.Wait()
@@ -1082,6 +1128,14 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 			// without an error.
 			if streamCtx.Err() != nil && ctx.Err() == nil {
 				captured := strings.TrimSpace(captureBuf.String())
+				// The user said only the wake word and stayed quiet through
+				// the grace window: hand the wake phrase to the LLM so it
+				// can greet them rather than silently dropping the turn.
+				if wakeOnlyFired.Load() && captured == "" {
+					s.logger.Infow("committing utterance (wake word only)",
+						"wake_phrase", wakePhrase)
+					return wakePhrase, nil
+				}
 				// Pure silence: listenTimer fired and we never captured any
 				// speech. Signal the caller so it can route to handleLull
 				// (conversation mode) or just loop (wake mode).
@@ -1133,7 +1187,11 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 				state = stateListening
 				s.setActivity("listening")
 				armListenTimeout()
+				wakePhrase = strings.TrimSpace(transcript)
 				after := strings.TrimSpace(transcript[idx+len(s.wakeWord):])
+				if after == "" && result.IsFinal {
+					armWakeOnlyTimer()
+				}
 				// Short-circuit if we've already got enough to work with:
 				// Google marked it final, OR the post-wake portion already
 				// carries at least maxWords. Both keep us from waiting on
@@ -1187,7 +1245,20 @@ func (s *service) listenForCommand(ctx context.Context, startInConversation bool
 					if post != "" {
 						return post, nil
 					}
-					return strings.TrimSpace(captureBuf.String()), nil
+					if captured := strings.TrimSpace(captureBuf.String()); captured != "" {
+						return captured, nil
+					}
+					if startInConversation {
+						return "", nil
+					}
+					// Wake mode, and the finalized segment held only the
+					// wake word: the user paused after it. Returning here
+					// would reopen the stream in idle mode and drop their
+					// command, so keep listening instead.
+					if trimmed != "" {
+						wakePhrase = trimmed
+					}
+					armWakeOnlyTimer()
 				}
 			}
 		}
