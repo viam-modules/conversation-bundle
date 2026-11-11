@@ -7,7 +7,7 @@ require (
 	cloud.google.com/go/texttospeech v1.19.0
 	github.com/anthropics/anthropic-sdk-go v1.37.0
 	go.bug.st/serial v1.7.0
-	go.viam.com/rdk v1.14.0
+	go.viam.com/rdk v1.16.0
 	google.golang.org/api v0.278.0
 )
 
@@ -83,7 +83,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/fullstorydev/grpcurl v1.8.6 // indirect
 	github.com/go-gl/mathgl v1.0.0 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
@@ -199,7 +199,7 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	go.viam.com/api v0.1.603 // indirect
 	go.viam.com/test v1.2.5 // indirect
-	go.viam.com/utils v0.16.1 // indirect
+	go.viam.com/utils v0.16.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20230525183740-e7c30c78aeb2 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
