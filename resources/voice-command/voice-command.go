@@ -594,43 +594,66 @@ func buildSystemPrompt(cmds []CommandEntry, userSuffix string) string {
 
 func (s *service) Name() resource.Name { return s.name }
 
-// commandFaultPollInterval is how often pollCommandFault refreshes faultCached.
-// The poll runs off the Status() hot path (led-bridge hits Status() ~5x/s), so
-// this bounds how stale the cached flag can be without coupling the RPC rate to
-// the poll rate; well under the source's fault window (a few seconds).
-const commandFaultPollInterval = 500 * time.Millisecond
+const (
+	// commandFaultPollInterval is how often pollCommandFault refreshes
+	// faultCached from a source that publishes fault_active. The poll runs off
+	// the Status() hot path (led-bridge hits Status() ~5x/s), so this bounds
+	// how stale the cached flag can be without coupling the RPC rate to the
+	// poll rate; well under the source's fault window (a few seconds).
+	commandFaultPollInterval = 500 * time.Millisecond
+	// commandFaultBackoff is the wait after a Status() that failed, or before
+	// the source has ever published fault_active. Each poll is cut off after
+	// commandFaultTimeout, and a source slower than that would otherwise get a
+	// fresh request twice a second while the cancelled ones may still be
+	// running on its side, which can back it up until it stops answering at
+	// all. A source used only to describe the scene (a customer detector, say)
+	// never publishes the flag and gains nothing from being polled for it.
+	commandFaultBackoff = 5 * time.Second
+	// commandFaultTimeout bounds one poll so a wedged source can't stall it.
+	commandFaultTimeout = time.Second
+)
 
 // pollCommandFault refreshes faultCached from the command_status resource until
 // workerCtx is cancelled. Started from New only when a command_status resource
-// is configured, so faultCached stays false otherwise.
+// is configured, so faultCached stays false otherwise. Polling runs at
+// commandFaultPollInterval once the source has published fault_active and
+// while it answers, and at commandFaultBackoff otherwise.
 func (s *service) pollCommandFault() {
 	defer s.workerWG.Done()
-	ticker := time.NewTicker(commandFaultPollInterval)
-	defer ticker.Stop()
+	publishes := false
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
-		s.faultCached.Store(s.fetchCommandFault())
 		select {
 		case <-s.workerCtx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		active, reported, err := s.fetchCommandFault()
+		s.faultCached.Store(active)
+		publishes = publishes || reported
+		wait := commandFaultPollInterval
+		if err != nil || !publishes {
+			wait = commandFaultBackoff
+		}
+		timer.Reset(wait)
 	}
 }
 
 // fetchCommandFault reads the conventional fault_active flag from the
-// command_status resource's Status(). A missing flag or fetch failure reads as
-// "no fault". The call is bounded so a wedged source can't stall the poller.
-func (s *service) fetchCommandFault() bool {
-	ctx, cancel := context.WithTimeout(s.workerCtx, time.Second)
+// command_status resource's Status(). reported says whether the flag was
+// present; a missing flag or fetch failure reads as "no fault".
+func (s *service) fetchCommandFault() (active, reported bool, err error) {
+	ctx, cancel := context.WithTimeout(s.workerCtx, commandFaultTimeout)
 	defer cancel()
 	status, err := s.commandStatus.handle.Status(ctx)
 	if err != nil {
 		s.logger.Debugw("command status fetch for fault flag failed",
 			"resource", s.commandStatus.name, "err", err)
-		return false
+		return false, false, err
 	}
-	active, _ := status["fault_active"].(bool)
-	return active
+	active, reported = status["fault_active"].(bool)
+	return active, reported, nil
 }
 
 func (s *service) Status(ctx context.Context) (map[string]interface{}, error) {
@@ -1305,14 +1328,23 @@ type interpretedReply struct {
 	Arguments map[string]interface{} `json:"arguments,omitempty"`
 }
 
+// contextFetchTimeout bounds fetchContext. Every turn waits on it before the
+// LLM call, so a slow or wedged sensor or command_status resource delays the
+// reply by at most this long; without it the wait lasts until the RPC's own
+// deadline, which is minutes.
+const contextFetchTimeout = 3 * time.Second
+
 // fetchContext concurrently gathers sensor Readings() for the ambient
 // sensors[] list and Status() for the optional command-status resource.
-// Failures are captured as {"error": "..."} under their slot so the LLM
-// call can still proceed with partial data.
+// Failures, including fetches still running after contextFetchTimeout, are
+// captured as {"error": "..."} under their slot so the LLM call can still
+// proceed with partial data.
 func (s *service) fetchContext(ctx context.Context) (sensorReadings map[string]interface{}, commandStatus map[string]interface{}) {
 	if len(s.sensors) == 0 && s.commandStatus == nil {
 		return nil, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, contextFetchTimeout)
+	defer cancel()
 	sensorReadings = make(map[string]interface{}, len(s.sensors))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
