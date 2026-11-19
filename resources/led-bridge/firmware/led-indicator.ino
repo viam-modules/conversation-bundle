@@ -21,6 +21,11 @@
 //   - "responding"  -> solid orange
 //   - "error"       -> red flash (~400ms on/off) until another state arrives
 // Any line without a recognized keyword is logged and ignored.
+//
+// led-bridge resends the current state every few seconds, so handling a
+// repeated state must stay harmless. It also reads the "ready" and
+// "received line: ..." output back as proof the sketch is running: once it has
+// seen them, a long silence makes it reset the board through RTS/DTR.
 
 #include <Adafruit_NeoPixel.h>
 

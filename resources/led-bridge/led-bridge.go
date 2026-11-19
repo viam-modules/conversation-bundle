@@ -3,13 +3,21 @@
 // drives a USB-serial LED indicator firmware to match. The source (named by
 // status_source, e.g. voice-command) knows nothing about LEDs; the firmware (a
 // separate ESP32 sketch) owns the visuals.
+//
+// The link is treated as lossy: the USB-serial adapter can drop off the bus
+// and the ESP32 can stop running its sketch, and a strip keeps showing its
+// last colour until it is told otherwise. So the bridge resends the current
+// state every resendInterval rather than only on change, drops the port as
+// soon as a read fails, and hard-resets an ESP32 that has stopped answering.
 package ledbridge
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +37,18 @@ const (
 	// reconnectBackoff throttles reconnect attempts while the device is down.
 	// Opening the port resets the ESP, so unthrottled retries would reboot-loop it.
 	reconnectBackoff = 2 * time.Second
+	// resendInterval is how often the current state is written again while it
+	// is unchanged. A line can be lost while the adapter re-enumerates or the
+	// ESP32 boots, and the firmware treats a repeated state as a no-op.
+	resendInterval = 3 * time.Second
+	// unresponsiveAfter is how long writes may go unanswered before the ESP32
+	// is reset. It spans several resends and the firmware's ~2.5 s boot.
+	unresponsiveAfter = 10 * time.Second
+	// resetCooldown keeps a board that never comes back from being reset in a
+	// tight loop.
+	resetCooldown = 30 * time.Second
+	// resetPulse is how long EN is held low, as esptool does.
+	resetPulse = 100 * time.Millisecond
 )
 
 // errBackoff means the port is disconnected and we're waiting out
@@ -88,6 +108,17 @@ func actionForState(state string) (map[string]interface{}, bool) {
 	}
 }
 
+// isFirmwareReply reports whether a line read from the port is the reference
+// firmware talking: it prints "ready" after boot and echoes every line it
+// handles. Matching these, rather than any bytes, keeps the ESP32 ROM
+// bootloader's output (e.g. "waiting for download") from passing as a reply.
+func isFirmwareReply(line string) bool {
+	line = strings.TrimSpace(line)
+	return line == "ready" ||
+		strings.HasPrefix(line, "received line:") ||
+		strings.HasPrefix(line, "-> ")
+}
+
 type bridge struct {
 	resource.AlwaysRebuild
 
@@ -98,6 +129,13 @@ type bridge struct {
 	pollInterval time.Duration
 	stateKey     string
 
+	// Timings default to the package constants; tests shorten them.
+	reconnectBackoff  time.Duration
+	resendInterval    time.Duration
+	unresponsiveAfter time.Duration
+	resetCooldown     time.Duration
+	openPort          func(path string, mode *serial.Mode) (serial.Port, error)
+
 	// connMu guards the serial connection (port, lastDial) and serializes
 	// writes so bytes don't interleave. port is nil while disconnected.
 	connMu     sync.Mutex
@@ -106,9 +144,19 @@ type bridge struct {
 	serialPort string // connection params: kept for reconnect + Status.
 	baudRate   int
 
-	// mu guards lastState (the state we last acted on; used to write on change).
-	mu        sync.Mutex
-	lastState string
+	// mu guards the state last written and the firmware liveness tracking.
+	mu          sync.Mutex
+	lastState   string
+	lastWriteAt time.Time
+	// firmwareReplied is set once the firmware has answered at all. Only then
+	// is silence treated as a hang, so firmware that never echoes is not reset.
+	firmwareReplied bool
+	lastReplyAt     time.Time
+	// awaitingReplySince is when the oldest unanswered write went out; zero
+	// when every write has been answered.
+	awaitingReplySince time.Time
+	lastResetAt        time.Time
+	firmwareResets     int64
 
 	// statsMu guards the diagnostic counters. Separate from connMu so a Status
 	// query never blocks behind a slow port.Write.
@@ -122,6 +170,8 @@ type bridge struct {
 	workerCtx    context.Context
 	workerCancel context.CancelFunc
 	workerWG     sync.WaitGroup
+	// readerWG tracks the reply reader of each opened port.
+	readerWG sync.WaitGroup
 }
 
 func newService(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -147,18 +197,7 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 		return nil, fmt.Errorf("status_source %q not found: %w", conf.StatusSource, err)
 	}
 
-	workerCtx, workerCancel := context.WithCancel(context.Background())
-	b := &bridge{
-		name:         rawConf.ResourceName(),
-		logger:       logger,
-		source:       source,
-		pollInterval: pollInterval,
-		stateKey:     stateKey,
-		serialPort:   conf.SerialPort,
-		baudRate:     baud,
-		workerCtx:    workerCtx,
-		workerCancel: workerCancel,
-	}
+	b := newBridge(rawConf.ResourceName(), logger, source, conf.SerialPort, baud, pollInterval, stateKey)
 	// Connect now so a healthy device works immediately and a bad port surfaces
 	// in the logs — but don't fail construction if the device is absent; the
 	// poll loop reconnects when it appears.
@@ -169,15 +208,46 @@ func newService(ctx context.Context, deps resource.Dependencies, rawConf resourc
 		logger.Warnw("led-bridge serial port unavailable; will keep retrying",
 			"port", conf.SerialPort, "err", oerr)
 	}
+	b.start()
+	return b, nil
+}
+
+func newBridge(
+	name resource.Name,
+	logger logging.Logger,
+	source resource.Resource,
+	serialPort string,
+	baud int,
+	pollInterval time.Duration,
+	stateKey string,
+) *bridge {
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	return &bridge{
+		name:              name,
+		logger:            logger,
+		source:            source,
+		pollInterval:      pollInterval,
+		stateKey:          stateKey,
+		reconnectBackoff:  reconnectBackoff,
+		resendInterval:    resendInterval,
+		unresponsiveAfter: unresponsiveAfter,
+		resetCooldown:     resetCooldown,
+		openPort:          serial.Open,
+		serialPort:        serialPort,
+		baudRate:          baud,
+		workerCtx:         workerCtx,
+		workerCancel:      workerCancel,
+	}
+}
+
+func (b *bridge) start() {
 	b.workerWG.Add(1)
 	go b.run()
-	return b, nil
 }
 
 func (b *bridge) Name() resource.Name { return b.name }
 
-// run polls the source's Status() and writes to the firmware whenever the
-// reported state changes.
+// run polls the source's Status() and keeps the firmware showing its state.
 func (b *bridge) run() {
 	defer b.workerWG.Done()
 	ticker := time.NewTicker(b.pollInterval)
@@ -192,7 +262,12 @@ func (b *bridge) run() {
 	}
 }
 
+// tick writes the source's state when it changes, and again every
+// resendInterval while it doesn't, then resets the ESP32 if it has stopped
+// answering.
 func (b *bridge) tick() {
+	defer b.resetIfUnresponsive()
+
 	status, err := b.source.Status(b.workerCtx)
 	if err != nil {
 		b.logger.Warnw("status_source Status() failed", "err", err)
@@ -202,29 +277,81 @@ func (b *bridge) tick() {
 	if state == "" {
 		return
 	}
+	payload, ok := actionForState(state)
 
 	b.mu.Lock()
 	changed := state != b.lastState
+	due := changed || (ok && time.Since(b.lastWriteAt) >= b.resendInterval)
 	b.mu.Unlock()
-	if !changed {
+	if !due {
 		return
 	}
 
-	payload, ok := actionForState(state)
 	if ok {
 		if err := b.write(payload); err != nil {
 			// Don't commit lastState — retry on the next tick so a transient
 			// serial hiccup self-heals. write() logs the error.
 			return
 		}
-	} else {
+	} else if changed {
 		b.logger.Debugw("no action mapped; leaving LED unchanged", "state", state)
 	}
 
-	// Commit only after handling, so we don't re-process the same state.
 	b.mu.Lock()
 	b.lastState = state
+	b.lastWriteAt = time.Now()
 	b.mu.Unlock()
+}
+
+// resetIfUnresponsive hard-resets the ESP32 when writes have gone unanswered
+// for unresponsiveAfter. A sketch that hung, or a board left in its ROM
+// bootloader by a USB brownout, still accepts bytes through the adapter but
+// never acts on them, so the strip stays on its last colour.
+func (b *bridge) resetIfUnresponsive() {
+	now := time.Now()
+	b.mu.Lock()
+	hung := b.firmwareReplied &&
+		!b.awaitingReplySince.IsZero() &&
+		now.Sub(b.awaitingReplySince) >= b.unresponsiveAfter &&
+		now.Sub(b.lastResetAt) >= b.resetCooldown
+	var silentFor time.Duration
+	if hung {
+		silentFor = now.Sub(b.awaitingReplySince)
+		b.lastResetAt = now
+		b.awaitingReplySince = time.Time{}
+		b.firmwareResets++
+	}
+	b.mu.Unlock()
+	if !hung {
+		return
+	}
+
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
+	if b.port == nil {
+		return
+	}
+	b.logger.Warnw("LED firmware stopped answering; resetting the ESP32",
+		"port", b.serialPort, "unanswered_for", silentFor.String())
+	if err := pulseReset(b.port); err != nil {
+		b.closeLocked()
+		b.recordError(fmt.Errorf("reset ESP32: %w", err))
+	}
+}
+
+// pulseReset reboots an ESP32 dev board into its sketch through the adapter's
+// auto-reset circuit: RTS drives EN and DTR drives GPIO0, so holding RTS with
+// DTR released resets the chip with GPIO0 high (normal boot). This is
+// esptool's hard-reset sequence.
+func pulseReset(port serial.Port) error {
+	if err := port.SetDTR(false); err != nil {
+		return err
+	}
+	if err := port.SetRTS(true); err != nil {
+		return err
+	}
+	time.Sleep(resetPulse)
+	return port.SetRTS(false)
 }
 
 // write sends payload as line-delimited JSON over serial, (re)connecting the
@@ -261,6 +388,11 @@ func (b *bridge) write(payload map[string]interface{}) error {
 		return fmt.Errorf("write to serial port: %w", werr)
 	}
 	b.recordSuccess(n)
+	b.mu.Lock()
+	if b.awaitingReplySince.IsZero() {
+		b.awaitingReplySince = time.Now()
+	}
+	b.mu.Unlock()
 	return nil
 }
 
@@ -271,17 +403,53 @@ func (b *bridge) openLocked() (serial.Port, error) {
 	if b.port != nil {
 		return b.port, nil
 	}
-	if time.Since(b.lastDial) < reconnectBackoff {
+	if time.Since(b.lastDial) < b.reconnectBackoff {
 		return nil, errBackoff
 	}
 	b.lastDial = time.Now()
-	port, err := serial.Open(b.serialPort, &serial.Mode{BaudRate: b.baudRate})
+	port, err := b.openPort(b.serialPort, &serial.Mode{BaudRate: b.baudRate})
 	if err != nil {
 		return nil, err
 	}
 	b.port = port
+	// Writes sent before the drop were never going to be answered; judge the
+	// firmware only on what it is sent from here on.
+	b.mu.Lock()
+	b.awaitingReplySince = time.Time{}
+	b.mu.Unlock()
+	b.readerWG.Add(1)
+	go b.readReplies(port)
 	b.logger.Infow("led-bridge serial port opened", "port", b.serialPort, "baud", b.baudRate)
 	return port, nil
+}
+
+// readReplies reads the firmware's lines from port until the port fails or
+// is closed. A failed read is how an unplugged adapter shows up, so the port
+// is dropped at once instead of on the next write.
+func (b *bridge) readReplies(port serial.Port) {
+	defer b.readerWG.Done()
+	scanner := bufio.NewScanner(port)
+	for scanner.Scan() {
+		if isFirmwareReply(scanner.Text()) {
+			b.mu.Lock()
+			b.firmwareReplied = true
+			b.lastReplyAt = time.Now()
+			b.awaitingReplySince = time.Time{}
+			b.mu.Unlock()
+		}
+	}
+
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
+	if b.port != port {
+		return // closed deliberately, or already replaced
+	}
+	b.closeLocked()
+	err := scanner.Err()
+	if err == nil {
+		err = errors.New("serial port closed")
+	}
+	b.recordError(fmt.Errorf("read from serial port: %w", err))
 }
 
 // closeLocked closes and clears the port so the next openLocked reconnects.
@@ -315,11 +483,14 @@ func (b *bridge) recordError(err error) {
 }
 
 // Status reports the last state acted on plus connection/serial-write health
-// (connected, port, baud, message/byte counts, last send, last error) so an
-// operator can confirm the LED is wired up and receiving data.
+// (connected, port, baud, message/byte counts, last send, last error) and
+// firmware liveness (last reply, resets) so an operator can confirm the LED
+// is wired up and acting on what it is sent.
 func (b *bridge) Status(ctx context.Context) (map[string]interface{}, error) {
 	b.mu.Lock()
 	lastState := b.lastState
+	lastReplyAt := b.lastReplyAt
+	firmwareResets := b.firmwareResets
 	b.mu.Unlock()
 
 	b.connMu.Lock()
@@ -329,15 +500,19 @@ func (b *bridge) Status(ctx context.Context) (map[string]interface{}, error) {
 	b.statsMu.Lock()
 	defer b.statsMu.Unlock()
 	status := map[string]interface{}{
-		"last_state":    lastState,
-		"connected":     connected,
-		"serial_port":   b.serialPort,
-		"baud_rate":     b.baudRate,
-		"messages_sent": b.messagesSent,
-		"bytes_sent":    b.bytesSent,
+		"last_state":      lastState,
+		"connected":       connected,
+		"serial_port":     b.serialPort,
+		"baud_rate":       b.baudRate,
+		"messages_sent":   b.messagesSent,
+		"bytes_sent":      b.bytesSent,
+		"firmware_resets": firmwareResets,
 	}
 	if !b.lastSentAt.IsZero() {
 		status["last_sent_at"] = b.lastSentAt.Format(time.RFC3339Nano)
+	}
+	if !lastReplyAt.IsZero() {
+		status["last_reply_at"] = lastReplyAt.Format(time.RFC3339Nano)
 	}
 	if b.lastError != "" {
 		status["last_error"] = b.lastError
@@ -365,9 +540,13 @@ func (b *bridge) Close(ctx context.Context) error {
 	}
 	b.workerWG.Wait()
 	b.connMu.Lock()
-	defer b.connMu.Unlock()
+	var err error
 	if b.port != nil {
-		return b.port.Close()
+		err = b.port.Close()
+		b.port = nil
 	}
-	return nil
+	b.connMu.Unlock()
+	// The reader takes connMu once its read fails, so wait for it unlocked.
+	b.readerWG.Wait()
+	return err
 }
